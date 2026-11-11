@@ -934,6 +934,14 @@ int main(int argc, char** argv)
     if(!readShapeSettings(shapeSettings)) { EndBatchDraw(); closegraph(); return 0; }
     double stoneSpeed=1.5;
     TerrainSettings terrainSettings;      //当前地形参数（按 T 修改）
+
+    if (readTerrainSettings(terrainSettings) == 1)
+    {
+        hill = HillSlope(buildTerrain(terrainSettings));
+        initX = hill.getPeakX();
+        initZ = hill.getHeight((double)initX);
+    }
+
     PolygonShape initial=generatePolygon(3,2,3,shapeRng);
     for(;;) {
         try { initial=generatePolygon(shapeSettings,shapeRng); break; }
