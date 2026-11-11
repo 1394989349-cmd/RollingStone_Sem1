@@ -374,39 +374,63 @@ PolygonShape generatePolygon(int k, double r, double target, std::mt19937& rng)
         for(int i=0;i<k;++i) { double a=rotation+2*POLY_PI*i/k; p.push_back(Point(r*cos(a),r*sin(a))); }
         return PolygonShape(p,r);
     }
-    for(int attempt=0;attempt<50000;++attempt) {
-        std::vector<double> a(k-1);
-        for(int i=0;i<k-1;++i) a[i]=randomUnit(rng)*2*POLY_PI;
-        std::sort(a.begin(),a.end());
-        bool distinct=true; double base=0;
-        for(int i=0;i<k-1;++i) {
-            double gap=(i+1==k-1?a[0]+2*POLY_PI:a[i+1])-a[i];
-            if(gap<1e-7) distinct=false;
-            base+=r*r*sin(gap)/2;
-        }
-        if(!distinct || target<=base) continue;
-        std::vector<double> solutions;
-        for(int i=0;i<k-1;++i) {
-            double lo=a[i], hi=(i+1==k-1?a[0]+2*POLY_PI:a[i+1]);
-            double half=(hi-lo)/2;
-            // S = base + r^2*sin(half)*(cos(theta-mid)-cos(half)).
-            double c=(target-base)/(r*r*sin(half))+cos(half);
-            if(c>1 || c< -1) continue;
-            double d=acos(c), mid=(lo+hi)/2;
-            if(half-d<1e-7) continue;
-            solutions.push_back(fmod(mid-d,2*POLY_PI));
-            if(d>1e-10) solutions.push_back(fmod(mid+d,2*POLY_PI));
-        }
-        if(solutions.empty()) continue;
-        std::uniform_int_distribution<int> choose(0,(int)solutions.size()-1);
-        a.push_back(solutions[choose(rng)]); std::sort(a.begin(),a.end());
-        std::vector<Point> p;
-        for(size_t i=0;i<a.size();++i) p.push_back(Point(r*cos(a[i]),r*sin(a[i])));
-        PolygonShape shape(p,r);
-        if(fabs(shape.area-target)<=1e-9*r*r) return shape;
+    // 定面积条件采样，不是独立均匀圆周采样。随机改变前 k-1 点的角间隔，
+    // 根据面积确定它们所占圆弧的跨度；第 k 点仍由面积方程解析求解。
+    // 直接全圆独立采样会使“小面积+多顶点”的接受率趋近零。
+    const int m=k-1;
+    const double spacing=2*POLY_PI/k;
+    const double referenceSpan=(k-2)*spacing;
+    std::vector<double> jitter(m,0), fractions(m);
+    for(int i=1;i<m-1;++i) jitter[i]=(randomUnit(rng)-0.5)*0.8*spacing;
+    auto baseArea = [&](double span) {
+        double sum=0;
+        for(int i=0;i<m-1;++i) sum+=sin(span*(fractions[i+1]-fractions[i]));
+        return r*r*(sum-sin(span))/2;
+    };
+    // 在首尾之间的闭合圆弧内添加一点，面积增加量的上限（插入弧中点）。
+    auto maxAddition = [&](double span) {
+        return r*r*sin(span/2)*(1+cos(span/2));
+    };
+    double refBase=0,refAddition=maxAddition(referenceSpan);
+    double amplitude=1;
+    bool feasible=false;
+    for(int iteration=0;iteration<60;++iteration) {
+        for(int i=0;i<m;++i) fractions[i]=(i*spacing+amplitude*jitter[i])/referenceSpan;
+        refBase=baseArea(referenceSpan);
+        if(refBase+refAddition>=target) { feasible=true; break; }
+        // 接近最大面积时可行形状接近正多边形，收窄随机角间隔扰动。
+        amplitude*=0.5;
     }
-    // 不偷偷缩放半径、修改面积、换边数或退化成别的采样分布。
-    throw std::runtime_error("No sample found in 50000 attempts. Retry or choose a less extreme area/side range.");
+    if(!feasible) throw std::runtime_error("Area construction failed at floating-point precision.");
+    // q 是第 k 点提供的面积增量占当前圆弧最大增量的比例。
+    // 在参考跨度处确保总面积 >= S，零跨度处面积为0，因而始终有根。
+    double qMin=max(0.05,(target-refBase)/refAddition);
+    qMin=min(1.0,qMin);
+    double q=qMin+(1-qMin)*(0.1+0.8*randomUnit(rng));
+    double lo=0,hi=referenceSpan;
+    for(int iteration=0;iteration<80;++iteration) {
+        double mid=(lo+hi)/2;
+        if(baseArea(mid)+q*maxAddition(mid)<target) lo=mid;
+        else hi=mid;
+    }
+    double span=(lo+hi)/2;
+    double halfGap=POLY_PI-span/2;
+    // 使用实际剩余面积求第 k 点，避免二分误差累积到面积约束。
+    double cosine=cos(halfGap)+(target-baseArea(span))/(r*r*sin(halfGap));
+    cosine=max(-1.0,min(1.0,cosine));
+    double offset=acos(cosine), midpoint=(span+2*POLY_PI)/2;
+    double last=midpoint+((rng()&1)?offset:-offset);
+    if(last<=span || last>=2*POLY_PI) throw std::runtime_error("Degenerate final vertex.");
+    double rotation=randomUnit(rng)*2*POLY_PI;
+    std::vector<Point> p;
+    for(int i=0;i<m;++i) {
+        double angle=rotation+span*fractions[i];
+        p.push_back(Point(r*cos(angle),r*sin(angle)));
+    }
+    p.push_back(Point(r*cos(rotation+last),r*sin(rotation+last)));
+    PolygonShape shape(p,r);
+    if(fabs(shape.area-target)>1e-9*r*r) throw std::runtime_error("Area verification failed.");
+    return shape;
 }
 PolygonShape generatePolygon(const ShapeSettings& c, std::mt19937& rng)
 {
@@ -607,6 +631,18 @@ int polygonSelfTest()
                 requireTest(cross2(minus2(b,a),minus2(c,b))>0,"strict convexity");
             }
         }
+        // 用户复现：10 20 7 20，每个可选边数都必须能生成，不能偷偷换边数。
+        for(int k=10;k<=20;++k) for(int trial=0;trial<100;++trial) {
+            PolygonShape p=generatePolygon(k,7,20,rng);
+            requireTest(p.local.size()==(size_t)k,"10 20 7 20 side count");
+            requireTest(fabs(p.area-20)<1e-8,"10 20 7 20 area");
+            for(int i=0;i<k;++i) {
+                Point q=minus2(p.local[i],p.circleCenter);
+                requireTest(fabs(sqrt(dot2(q,q))-7)<1e-9,"10 20 7 20 radius");
+                Point a=p.local[i],b=p.local[(i+1)%k],c=p.local[(i+2)%k];
+                requireTest(cross2(minus2(b,a),minus2(c,b))>0,"10 20 7 20 convexity");
+            }
+        }
         PolygonShape square=generatePolygon(4,1,2,rng);
         requireTest(fabs(square.inertia/square.mass-1.0/3)<1e-10,"square inertia");
         bool rejected=false;
@@ -656,8 +692,28 @@ int polygonSelfTest()
                 requireTest(body.getEnergy()<p.mass*GRAVITY*100,"no explosive energy gain");
             }
         }
+        // 小面积/多顶点的运动也走真实接触求解器，不只验证外形。
+        for(int k=10;k<=20;++k) {
+            PolygonShape p=generatePolygon(k,7,20,rng);
+            RollingStone body(2,hill.getHeight(2),p); body.adjustToGround(hill); body.startAlongSlope(hill,1.5);
+            for(int i=0;i<20000 && body.isMoving() && body.getX()<hill.getEndX();++i) {
+                body.update(hill,DT); maxPen=max(maxPen,body.penetration(hill));
+                requireTest(body.getEnergy()<p.mass*GRAVITY*100,"10 20 7 20 stable motion");
+            }
+        }
+        // 边数上下限、低面积、接近最大面积，防止在另一端出现新的拒绝采样失败。
+        for(int k=3;k<=30;++k) for(int mode=0;mode<3;++mode) {
+            double r=7;
+            double target=mode==0?1.0001e-4*r*r:maxPolygonArea(k,r)*(mode==1?0.99:0.999999);
+            PolygonShape p=generatePolygon(k,r,target,rng);
+            requireTest(fabs(p.area-target)<1e-8,"extreme area accuracy");
+            for(int i=0;i<k;++i) {
+                Point a=p.local[i],b=p.local[(i+1)%k],c=p.local[(i+2)%k];
+                requireTest(cross2(minus2(b,a),minus2(c,b))>0,"extreme area convexity");
+            }
+        }
         requireTest(maxPen<0.01,"slope penetration");
-        std::printf("PASS: 300 random geometries, area/radius/convexity, inertia, invalid input, restitution, free fall, ridge contact, regular limit, deterministic seed, drop/rest and 12 slope trajectories. Max area/r^2 error=%.3g; max penetration=%.6g m\n",worstArea,maxPen);
+        std::printf("PASS: 300 random geometries + 1100 samples for input 10 20 7 20, area/radius/convexity, inertia, invalid input, restitution, free fall, ridge contact, regular limit, deterministic seed, drop/rest, 23 slope trajectories and 84 extreme-area samples. Max area/r^2 error=%.3g; max penetration=%.6g m\n",worstArea,maxPen);
         return 0;
     } catch(const std::exception& e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
 }
