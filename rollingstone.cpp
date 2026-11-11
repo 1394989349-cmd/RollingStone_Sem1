@@ -5,6 +5,7 @@
 #define _WIN32_WINNT WINVER
 #endif
 #define NOMINMAX
+#define _CRT_SECURE_NO_WARNINGS
 #include <graphics.h>
 #include <conio.h>
 #include <math.h>
@@ -629,6 +630,7 @@ class RollingStone
     double x,z,vx,vz,angle,omega,quietTime;
     bool moving;
     DynamicArray<Point> trail;
+    int trailMax;
     struct Contact { Point arm, normal; double depth, normalSum, tangentSum, bounce; bool barrier; };
     std::vector<Point> vertices() const {
         std::vector<Point> v;
@@ -756,7 +758,7 @@ class RollingStone
     }
 public:
     RollingStone(double startX, double startZ, const PolygonShape& p)
-        : shape(p),x(startX),z(startZ),vx(0),vz(0),angle(0),omega(0),quietTime(0),moving(true) {}
+        : shape(p),x(startX),z(startZ),vx(0),vz(0),angle(0),omega(0),quietTime(0),moving(true),trailMax(80) {}
     void update(const HillSlope& hill, double dt, ElasticBarrier* barrier=nullptr) {
         if(!(dt>0) || !std::isfinite(dt)) throw std::invalid_argument("dt must be positive and finite");
         bool coupled=barrier && barrier->enabled();
@@ -773,7 +775,10 @@ public:
             for(size_t i=1;i<v.size();++i) minX=min(minX,v[i].x);
             if(minX>barrier->faceX()+0.05) barrier->markPassed();
         }
-        trail.push_back(Point(x,z)); if(trail.size()>80) trail.erase_front();
+        if (trailMax > 0) {
+            trail.push_back(Point(x,z));
+            if ((int)trail.size() > trailMax) trail.erase_front();
+        }
     }
     void draw() const {
         setcolor(RGB(210,80,30));
@@ -802,6 +807,7 @@ public:
         moving=true; quietTime=0;
     }
     bool isMoving() const { return moving; }
+    void setTrailMax(int n) { trailMax = (n < 0) ? 0 : n; }
     double getX() const { return x; } double getZ() const { return z; }
     double getSpeed() const { return sqrt(vx*vx+vz*vz); }
     double getEnergy() const { return 0.5*shape.mass*(vx*vx+vz*vz)+0.5*shape.inertia*omega*omega; }
@@ -1251,10 +1257,19 @@ int barrierDemo() {
     } catch(const std::exception& e) { std::fprintf(stderr,"Demo failed: %s\n",e.what()); return 1; }
 }
 
+#include "batch_stats.h"
 
 // ------------------------------------------------------------------ 主程序
 int main(int argc, char** argv)
 {
+    if (argc > 1 && (std::strcmp(argv[1], "--batch") == 0 ||
+                     std::strcmp(argv[1], "-b") == 0)) {
+        int n = (argc > 2) ? std::atoi(argv[2]) : 200;
+        unsigned int seed = (argc > 3)
+            ? (unsigned int)std::strtoul(argv[3], nullptr, 10)
+            : 2026u;
+        return runBatchSimulation(n, seed);
+    }
     if(argc>1 && std::strcmp(argv[1],"--self-test")==0) { int code=polygonSelfTest(); return code?code:barrierSelfTest(); }
     if(argc>1 && std::strcmp(argv[1],"--barrier-test")==0) return barrierSelfTest();
     if(argc>1 && std::strcmp(argv[1],"--barrier-demo")==0) return barrierDemo();

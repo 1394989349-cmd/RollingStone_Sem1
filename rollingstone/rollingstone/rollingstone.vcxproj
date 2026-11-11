@@ -124,6 +124,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="rollingstone.cpp" />
+    <ClInclude Include="batch_stats.h" />
   </ItemGroup>
   <ItemDefinitionGroup>
     <ClCompile>

@@ -10,6 +10,6 @@
 <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 <PropertyGroup><OutDir>$(ProjectDir)build/vs2022\$(Configuration)\</OutDir><IntDir>$(ProjectDir)build/vs2022\obj\$(Configuration)\</IntDir></PropertyGroup>
 <ItemDefinitionGroup><ClCompile><WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp14</LanguageStandard><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions><AdditionalIncludeDirectories>$(VCInstallDir)Auxiliary\VS\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile><Link><SubSystem>Console</SubSystem><AdditionalLibraryDirectories>$(VCInstallDir)Auxiliary\VS\lib/x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories></Link></ItemDefinitionGroup>
-<ItemGroup><ClCompile Include="rollingstone.cpp" /></ItemGroup>
+<ItemGroup><ClCompile Include="rollingstone.cpp" /><ClInclude Include="batch_stats.h" /></ItemGroup>
 <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
