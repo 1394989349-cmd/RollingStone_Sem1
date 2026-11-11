@@ -21,3 +21,6 @@ Release/
 # Local backups
 *.bak
 graphics_winbgim_backup.h
+
+# Locally generated numerical runs; curated reference data lives in examples/
+results/

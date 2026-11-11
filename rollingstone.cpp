@@ -1,4 +1,4 @@
-﻿#ifndef WINVER
+#ifndef WINVER
 #define WINVER 0x0500
 #endif
 #ifndef _WIN32_WINNT
@@ -21,6 +21,9 @@
 #include <stdexcept>
 #include <limits>
 #include <cerrno>
+#include <fstream>
+#include <iomanip>
+#include <locale>
 using namespace std;
 template <typename... Args>
 int formatText(TCHAR* buffer, size_t capacity, const TCHAR* format, Args... args)
@@ -42,7 +45,7 @@ int formatText(TCHAR* buffer, size_t capacity, const TCHAR* format, Args... args
 //  只有在“画图”这一步才换算成像素，换算比例 PX_PER_M
 //  刚体模型：均匀凸多边形沿屏幕法向挤出 1m；质量=rho*S*1m。
 //  使用真实质心、极惯性矩、接触点冲量、库仑摩擦和恢复系数。
-//  地形是静态折线；这是二维数值近似，不包括破碎、三维翻滚和材料变形。
+//  地形是静态折线；这是二维数值近似，不包括破碎和三维翻滚；新增水平单自由度弹簧阻尼等效挡板。
 //  接触求解采用固定步长、子步和迭代冲量；参考 https://box2d.org/documentation/md_simulation.html
 // ============================================================================
 
@@ -515,19 +518,124 @@ DynamicArray<Point> buildTerrain(const TerrainSettings& t)      //按地形参�
 }
 
 // ------------------------------------------------------------------ 多边形刚体与静态折线的接触
+// ------------------------------------------------------------------ 弹性挡板：水平单自由度等效模型（不绘制网格变形）
+// M*q'' + c*q' + k*q = contactForce。q 向右为正，挡板不作竖直运动。
+// 弹性来自支座弹簧，石头/挡板接触本身采用非弹性法向冲量，避免重复回弹。
+struct BarrierSettings {
+    bool enabled;
+    double x, height, mass, stiffness, damping;
+    BarrierSettings() : enabled(true), x(108), height(8), mass(2000), stiffness(500000), damping(30000) {}
+};
+
+class ElasticBarrier {
+    BarrierSettings settings;
+    double bottom, q, velocity, lastImpulse;
+    double maxQ, peakSupport, peakContact, damperLoss, integrationLoss, contactLoss;
+    bool touched, passed;
+public:
+    ElasticBarrier() : bottom(0),q(0),velocity(0),lastImpulse(0),maxQ(0),peakSupport(0),
+        peakContact(0),damperLoss(0),integrationLoss(0),contactLoss(0),touched(false),passed(false) {}
+    static void validate(const BarrierSettings& s, const HillSlope& hill) {
+        if(!std::isfinite(s.x+s.height+s.mass+s.stiffness+s.damping) ||
+            s.x<hill.getStartX()+2 || s.x>hill.getEndX()-2 || s.height<0.5 || s.height>30 ||
+            s.mass<1 || s.mass>1e7 || s.stiffness<0 || s.stiffness>1e8 || s.damping<0 || s.damping>1e7)
+            throw std::invalid_argument("Barrier: x inside terrain (2 m clearance), H=0.5..30, M=1..1e7, k=0..1e8, c=0..1e7.");
+    }
+    void reset(const HillSlope& hill, const BarrierSettings& s) {
+        validate(s,hill); settings=s; bottom=hill.getHeight(s.x);
+        q=velocity=lastImpulse=maxQ=peakSupport=peakContact=damperLoss=integrationLoss=contactLoss=0;
+        touched=passed=false;
+    }
+    const BarrierSettings& config() const { return settings; }
+    bool enabled() const { return settings.enabled; }
+    double faceX() const { return settings.x+q; }
+    double baseZ() const { return bottom; }
+    double topZ() const { return bottom+settings.height; }
+    double displacement() const { return q; }
+    double speed() const { return velocity; }
+    double inverseMass() const { return 1/settings.mass; }
+    double supportForce() const { return settings.stiffness*q+settings.damping*velocity; }
+    double energy() const { return 0.5*settings.mass*velocity*velocity+0.5*settings.stiffness*q*q; }
+    double kineticEnergy() const { return 0.5*settings.mass*velocity*velocity; }
+    double maxDisplacement() const { return maxQ; }
+    double peakSupportForce() const { return peakSupport; }
+    double peakContactForce() const { return peakContact; }
+    double dampingEnergy() const { return damperLoss; }
+    double numericalEnergy() const { return integrationLoss; }
+    double impactEnergy() const { return contactLoss; }
+    bool hasContact() const { return touched; }
+    bool hasPassed() const { return passed; }
+    bool settled() const { return !enabled() || fabs(velocity)<0.02; }
+    void markPassed() { if(enabled()) passed=true; }
+    void addContactEnergy(double value) { contactLoss+=value; }
+    void applyImpulse(double impulseX) {
+        velocity+=impulseX/settings.mass; lastImpulse+=impulseX;
+        if(fabs(impulseX)>1e-10) touched=true;
+    }
+    void beginStep(double h) {
+        if(!enabled()) return;
+        double oldV=velocity, oldQ=q;
+        // 后向 Euler：对高刚度弹簧稳定；明确记录其数值耗散，不当作物理阻尼。
+        velocity=(settings.mass*velocity-h*settings.stiffness*q)/
+            (settings.mass+h*settings.damping+h*h*settings.stiffness);
+        q+=h*velocity;
+        damperLoss+=h*settings.damping*velocity*velocity;
+        integrationLoss+=0.5*settings.mass*(velocity-oldV)*(velocity-oldV)+
+            0.5*settings.stiffness*(q-oldQ)*(q-oldQ);
+        lastImpulse=0;
+    }
+    void endStep(double h) {
+        if(!enabled()) return;
+        maxQ=max(maxQ,fabs(q)); peakSupport=max(peakSupport,fabs(supportForce()));
+        peakContact=max(peakContact,fabs(lastImpulse)/h);
+        if(!std::isfinite(q+velocity+damperLoss+integrationLoss+contactLoss))
+            throw std::runtime_error("Non-finite elastic barrier state");
+    }
+    void draw() const {
+        if(!enabled()) return;
+        // 只画等效挡板及水平弹簧符号，不生成网格或局部变形动画。
+        int xx=(int)toPxX(faceX()), yy=(int)toPxY(bottom), top=(int)toPxY(topZ());
+        setcolor(hasPassed()?RGB(210,70,50):RGB(30,110,180)); setlinestyle(PS_SOLID,4);
+        line(xx,yy,xx,top); setlinestyle(PS_SOLID,1);
+        int anchor=(int)toPxX(settings.x+3), mid=(yy+top)/2;
+        line(xx,mid,anchor,mid); line(anchor,mid-8,anchor,mid+8);
+    }
+};
+
+bool readBarrierSettings(BarrierSettings& s, const HillSlope& hill) {
+    for(;;) {
+        TCHAR buf[240], defaults[240];
+        formatText(defaults,240,_T("%.8g %.8g %.8g %.8g %.8g"),s.x,s.height,s.mass,s.stiffness,s.damping);
+        if(!InputBox(buf,240,_T("依次输入：位置x(m) 高度H(m) 等效质量M(kg) 刚度k(N/m) 阻尼c(N*s/m)\n例如：108 8 2000 500000 30000\n位置距地形两端至少2m；H=0.5~30；M>0；k,c>=0。\nB修改参数；V开关并重跑同一块石头；E导出数值。这里是等效弹性支承挡板。"),
+            _T("弹性挡板参数"),defaults,760,280,false)) return false;
+        double values[5]; TCHAR* cursor=buf; bool valid=true;
+        for(int i=0;i<5;++i) { TCHAR* end=cursor; errno=0; values[i]=_tcstod(cursor,&end);
+            if(end==cursor || errno==ERANGE || !std::isfinite(values[i])) valid=false; cursor=end; }
+        while(*cursor==_T(' ') || *cursor==_T('\t')) ++cursor;
+        BarrierSettings candidate=s;
+        candidate.x=values[0]; candidate.height=values[1]; candidate.mass=values[2];
+        candidate.stiffness=values[3]; candidate.damping=values[4];
+        try { if(!valid || *cursor) throw std::invalid_argument("Expected five finite numbers.");
+            ElasticBarrier::validate(candidate,hill); s=candidate; return true; }
+        catch(const std::exception& e) { MessageBoxA(GetHWnd(),e.what(),"Invalid barrier settings",MB_OK|MB_ICONWARNING); }
+    }
+}
+
+
 class RollingStone
 {
+    friend int barrierSelfTest();
     PolygonShape shape;
     double x,z,vx,vz,angle,omega,quietTime;
     bool moving;
     DynamicArray<Point> trail;
-    struct Contact { Point arm, normal; double depth, normalSum, tangentSum, bounce; };
+    struct Contact { Point arm, normal; double depth, normalSum, tangentSum, bounce; bool barrier; };
     std::vector<Point> vertices() const {
         std::vector<Point> v;
         for(size_t i=0;i<shape.local.size();++i) v.push_back(plus2(Point(x,z),rotate2(shape.local[i],angle)));
         return v;
     }
-    std::vector<Contact> contacts(const HillSlope& hill, double margin) const {
+    std::vector<Contact> contacts(const HillSlope& hill, double margin, const ElasticBarrier* barrier=nullptr) const {
         std::vector<Contact> out; std::vector<Point> v=vertices();
         for(size_t i=0;i<v.size();++i) {
             double th=hill.getSlopeAngle(v[i].x); Point n(sin(th),cos(th));
@@ -548,51 +656,86 @@ class RollingStone
                 if(d<=margin) out.push_back(Contact{minus2(p,Point(x,z)),n,-d,0,0,0});
             }
         }
+        // 单面竖直挡板：裁剪多边形到挡板高度，包含边穿过挡板端点的情况。
+        if(barrier && barrier->enabled()) {
+            std::vector<Point> clipped=v;
+            for(int boundary=0;boundary<2 && !clipped.empty();++boundary) {
+                double zz=boundary==0?barrier->baseZ():barrier->topZ();
+                std::vector<Point> next;
+                for(size_t i=0;i<clipped.size();++i) {
+                    Point a=clipped[i],b=clipped[(i+1)%clipped.size()];
+                    bool inA=boundary==0?a.z>=zz:a.z<=zz;
+                    bool inB=boundary==0?b.z>=zz:b.z<=zz;
+                    if(inA) next.push_back(a);
+                    if(inA!=inB) { double t=(zz-a.z)/(b.z-a.z); next.push_back(plus2(a,times2(minus2(b,a),t))); }
+                }
+                clipped.swap(next);
+            }
+            if(!clipped.empty()) {
+                double minX=clipped[0].x;
+                for(size_t i=1;i<clipped.size();++i) minX=min(minX,clipped[i].x);
+                // 已经完整越过的石头不被从下游吸回；本模型挡板只拦截上游来石。
+                if(minX<=barrier->faceX()+0.05) for(size_t i=0;i<clipped.size();++i) {
+                    double depth=clipped[i].x-barrier->faceX();
+                    if(depth>=-margin) out.push_back(Contact{minus2(clipped[i],Point(x,z)),Point(-1,0),depth,0,0,0,true});
+                }
+            }
+        }
         return out;
     }
-    double contactVelocity(const Contact& c, Point direction) const {
-        return dot2(Point(vx-omega*c.arm.z,vz+omega*c.arm.x),direction);
+    double contactVelocity(const Contact& c, Point direction, const ElasticBarrier* barrier=nullptr) const {
+        double surfaceV=(c.barrier && barrier)?barrier->speed():0;
+        return dot2(Point(vx-omega*c.arm.z-surfaceV,vz+omega*c.arm.x),direction);
     }
-    double effectiveMass(const Contact& c, Point direction) const {
+    double effectiveMass(const Contact& c, Point direction, const ElasticBarrier* barrier=nullptr) const {
         double lever=cross2(c.arm,direction);
-        return 1/shape.mass+lever*lever/shape.inertia;
+        // 返回的是逆有效质量；挡板只有水平自由度，竖直冲量由支座承担。
+        return 1/shape.mass+lever*lever/shape.inertia+
+            ((c.barrier && barrier)?direction.x*direction.x*barrier->inverseMass():0);
     }
-    void impulse(const Contact& c, Point direction, double amount) {
+    void impulse(const Contact& c, Point direction, double amount, ElasticBarrier* barrier=nullptr) {
+        double before=(c.barrier && barrier)?getEnergy()+barrier->kineticEnergy():0;
         vx+=direction.x*amount/shape.mass; vz+=direction.z*amount/shape.mass;
         omega+=cross2(c.arm,direction)*amount/shape.inertia;
+        if(c.barrier && barrier) {
+            barrier->applyImpulse(-direction.x*amount);
+            barrier->addContactEnergy(before-getEnergy()-barrier->kineticEnergy());
+        }
     }
-    void substep(const HillSlope& hill, double h) {
+    void substep(const HillSlope& hill, double h, ElasticBarrier* barrier=nullptr) {
+        if(barrier) barrier->beginStep(h);
         vz-=GRAVITY*h;
         double speed=sqrt(vx*vx+vz*vz);
         // 平动空气阻力：迎风宽度近似 2r，棱柱厚度 1m，隐式衰减防止反向。
         double damping=1+0.5*AIR_DENSITY*g_dragCoef*(2*shape.radius)*speed*h/shape.mass;
         vx/=damping; vz/=damping;
         x+=vx*h; z+=vz*h; angle=std::remainder(angle+omega*h,2*POLY_PI);
-        std::vector<Contact> c=contacts(hill,0.0002);
+        std::vector<Contact> c=contacts(hill,0.0002,barrier);
         for(size_t i=0;i<c.size();++i) {
-            double vn=contactVelocity(c[i],c[i].normal);
-            c[i].bounce=vn< -0.5 ? -g_restitution*vn : 0;
+            double vn=contactVelocity(c[i],c[i].normal,barrier);
+            // 挡板的回弹由弹簧产生；接触本身 e=0，不重复增加恢复冲量。
+            c[i].bounce=(!c[i].barrier && vn< -0.5) ? -g_restitution*vn : 0;
         }
         for(int iteration=0;iteration<20;++iteration) {
             for(size_t i=0;i<c.size();++i) {
                 Contact& q=c[i];
                 double old=q.normalSum;
-                q.normalSum=max(0.0,old+(q.bounce-contactVelocity(q,q.normal))/effectiveMass(q,q.normal));
-                impulse(q,q.normal,q.normalSum-old);
+                q.normalSum=max(0.0,old+(q.bounce-contactVelocity(q,q.normal,barrier))/effectiveMass(q,q.normal,barrier));
+                impulse(q,q.normal,q.normalSum-old,barrier);
                 Point tangent(q.normal.z,-q.normal.x);
-                double limit=g_slideFriction*q.normalSum;
+                double limit=(q.barrier?0.3:g_slideFriction)*q.normalSum;
                 old=q.tangentSum;
-                q.tangentSum=max(-limit,min(limit,old-contactVelocity(q,tangent)/effectiveMass(q,tangent)));
-                impulse(q,tangent,q.tangentSum-old);
+                q.tangentSum=max(-limit,min(limit,old-contactVelocity(q,tangent,barrier)/effectiveMass(q,tangent,barrier)));
+                impulse(q,tangent,q.tangentSum-old,barrier);
             }
         }
         double support=0;
-        for(size_t i=0;i<c.size();++i) support+=c[i].normalSum;
+        for(size_t i=0;i<c.size();++i) if(!c[i].barrier) support+=c[i].normalSum;
         double resistance=g_rollResist*shape.radius*support/shape.inertia;
         omega-=max(-resistance,min(resistance,omega));
         // 分离位置修正不改变速度，避免把穿透修正变成额外弹跳能量。
         for(int iteration=0;iteration<12;++iteration) {
-            std::vector<Contact> correction=contacts(hill,0);
+            std::vector<Contact> correction=contacts(hill,0,barrier);
             double worst=0;
             for(size_t i=0;i<correction.size();++i) {
                 Contact& q=correction[i]; worst=max(worst,q.depth);
@@ -603,22 +746,33 @@ class RollingStone
             }
             if(worst<=0.0001) break;
         }
+        if(barrier) barrier->endStep(h);
         if(!std::isfinite(x+z+vx+vz+angle+omega)) throw std::runtime_error("Non-finite rigid-body state");
         // 不能仅凭质心低速判断停止：还需接触支撑及转动足够慢，持续 2 秒。
         if(!c.empty() && getSpeed()<0.015 && fabs(omega)*shape.extent<0.015) quietTime+=h;
         else quietTime=0;
         if(quietTime>=2) { moving=false; vx=vz=omega=0; }
+        else moving=true;
     }
 public:
     RollingStone(double startX, double startZ, const PolygonShape& p)
         : shape(p),x(startX),z(startZ),vx(0),vz(0),angle(0),omega(0),quietTime(0),moving(true) {}
-    void update(const HillSlope& hill, double dt) {
-        if(!moving) return;
+    void update(const HillSlope& hill, double dt, ElasticBarrier* barrier=nullptr) {
+        if(!(dt>0) || !std::isfinite(dt)) throw std::invalid_argument("dt must be positive and finite");
+        bool coupled=barrier && barrier->enabled();
+        if(!moving && !coupled) return;
         // 运动越快/刚体越薄，子步越细；不改变外部统计/显示时间步长。
         double scale=max(0.0005,min(shape.radius*0.1,shape.area/(4*shape.radius)));
-        int n=max(2,(int)ceil((getSpeed()+fabs(omega)*shape.extent)*dt/scale));
+        double relativeSpeed=getSpeed()+fabs(omega)*shape.extent+(coupled?fabs(barrier->speed()):0);
+        int n=max(2,(int)ceil(relativeSpeed*dt/scale));
+        if(coupled) n=max(n,(int)ceil(dt*sqrt(barrier->config().stiffness/barrier->config().mass)/0.05));
         if(n>256) throw std::runtime_error("Motion requires too many collision substeps; choose a less thin shape.");
-        for(int i=0;i<n && moving;++i) substep(hill,dt/n);
+        for(int i=0;i<n && (moving || coupled);++i) substep(hill,dt/n,barrier);
+        if(coupled) {
+            std::vector<Point> v=vertices(); double minX=v[0].x;
+            for(size_t i=1;i<v.size();++i) minX=min(minX,v[i].x);
+            if(minX>barrier->faceX()+0.05) barrier->markPassed();
+        }
         trail.push_back(Point(x,z)); if(trail.size()>80) trail.erase_front();
     }
     void draw() const {
@@ -651,7 +805,9 @@ public:
     double getX() const { return x; } double getZ() const { return z; }
     double getSpeed() const { return sqrt(vx*vx+vz*vz); }
     double getEnergy() const { return 0.5*shape.mass*(vx*vx+vz*vz)+0.5*shape.inertia*omega*omega; }
+    double getHorizontalSpeed() const { return vx; }
     double getRadius() const { return shape.radius; }
+    const PolygonShape& getShape() const { return shape; }
     double getMass() const { return shape.mass; }
     double getArea() const { return shape.area; }
     double getOmega() const { return omega; }
@@ -916,10 +1072,192 @@ int polygonSelfTest()
     } catch(const std::exception& e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
 }
 
+// ------------------------------------------------------------------ 数值记录与 CSV（均为 SI 单位，CSV 中不混用 kJ 与 J）
+struct TrialSample {
+    double t,x,z,vx,vz,omega,rockKinetic,rockPotential,q,v,force,barrierEnergy,damper,numerical,impact;
+};
+void recordSample(std::vector<TrialSample>& samples,double t,const RollingStone& stone,const ElasticBarrier& barrier) {
+    samples.push_back(TrialSample{t,stone.getX(),stone.getZ(),stone.getHorizontalSpeed(),stone.getVerticalSpeed(),
+        stone.getOmega(),stone.getEnergy(),stone.getMass()*GRAVITY*stone.getZ(),barrier.displacement(),barrier.speed(),
+        barrier.supportForce(),barrier.energy(),barrier.dampingEnergy(),barrier.numericalEnergy(),barrier.impactEnergy()});
+}
+const char* trialOutcome(const RollingStone& stone,const ElasticBarrier& barrier,bool ended) {
+    if(!barrier.enabled()) return "barrier_disabled";
+    if(barrier.hasPassed()) return "passed_barrier";
+    if(ended && !stone.isMoving() && barrier.settled())
+        return barrier.hasContact()?"blocked_at_rest":"stopped_before_barrier";
+    return barrier.hasContact()?"contact_or_rebound":"not_reached";
+}
+void exportTrial(const std::string& prefix,const std::vector<TrialSample>& samples,const RollingStone& stone,
+    const ElasticBarrier& barrier,const HillSlope& hill,const char* reason,bool ended) {
+    std::ofstream trace(prefix+"_trajectory.csv"), summary(prefix+"_summary.csv"), config(prefix+"_config.csv");
+    trace.imbue(std::locale::classic()); summary.imbue(std::locale::classic()); config.imbue(std::locale::classic());
+    trace<<std::setprecision(15); summary<<std::setprecision(15); config<<std::setprecision(15);
+    if(!trace || !summary || !config) throw std::runtime_error("Cannot create CSV files in results directory.");
+    trace<<"time_s,rock_x_m,rock_z_m,rock_vx_m_s,rock_vz_m_s,rock_omega_rad_s,rock_kinetic_J,rock_potential_J,barrier_q_m,barrier_v_m_s,support_force_N,barrier_energy_J,damper_loss_J,numerical_loss_J,contact_loss_J\n";
+    for(size_t i=0;i<samples.size();++i) {
+        const TrialSample& a=samples[i];
+        trace<<a.t<<','<<a.x<<','<<a.z<<','<<a.vx<<','<<a.vz<<','<<a.omega<<','<<a.rockKinetic<<','<<a.rockPotential<<','
+            <<a.q<<','<<a.v<<','<<a.force<<','<<a.barrierEnergy<<','<<a.damper<<','<<a.numerical<<','<<a.impact<<'\n';
+    }
+    double time=samples.empty()?0:samples.back().t;
+    summary<<"outcome,termination,time_s,contacted,passed,max_abs_deflection_m,peak_support_force_N,peak_substep_average_contact_force_N,damper_loss_J,numerical_loss_J,contact_loss_J,final_rock_x_m,final_rock_speed_m_s,final_barrier_energy_J\n";
+    summary<<trialOutcome(stone,barrier,ended)<<','<<reason<<','<<time<<','<<barrier.hasContact()<<','<<barrier.hasPassed()<<','
+        <<barrier.maxDisplacement()<<','<<barrier.peakSupportForce()<<','<<barrier.peakContactForce()<<','<<barrier.dampingEnergy()<<','
+        <<barrier.numericalEnergy()<<','<<barrier.impactEnergy()<<','<<stone.getX()<<','<<stone.getSpeed()<<','<<barrier.energy()<<'\n';
+    const BarrierSettings& b=barrier.config(); const PolygonShape& p=stone.getShape();
+    config<<"parameter,value\nmodel,horizontal_1d_spring_damper_panel\ncontact_restitution,0\ncontact_friction,0.3\ncontact_solver_iterations,20\ninitial_angle_rad,0\n";
+    if(samples.size()>1) config<<"sample_dt_s,"<<samples[1].t-samples[0].t<<'\n';
+    config<<"barrier_enabled,"<<b.enabled<<"\nbarrier_rest_x_m,"<<b.x<<"\nbarrier_base_z_m,"<<barrier.baseZ()<<"\nbarrier_height_m,"<<b.height
+        <<"\nbarrier_mass_kg,"<<b.mass<<"\nstiffness_N_m,"<<b.stiffness<<"\ndamping_N_s_m,"<<b.damping
+        <<"\nrock_mass_kg,"<<p.mass<<"\nrock_area_m2,"<<p.area<<"\nrock_inertia_kg_m2,"<<p.inertia<<"\ncircle_radius_m,"<<p.radius
+        <<"\nground_friction,"<<g_slideFriction<<"\nground_restitution,"<<g_restitution<<"\nrolling_resistance,"<<g_rollResist<<"\nair_drag_coefficient,"<<g_dragCoef<<'\n';
+    if(!samples.empty()) {
+        const TrialSample& a=samples.front();
+        config<<"initial_x_m,"<<a.x<<"\ninitial_z_m,"<<a.z<<"\ninitial_vx_m_s,"<<a.vx<<"\ninitial_vz_m_s,"<<a.vz<<"\ninitial_omega_rad_s,"<<a.omega<<'\n';
+    }
+    for(size_t i=0;i<p.local.size();++i) config<<"rock_vertex_"<<i<<"_local_x_m,"<<p.local[i].x<<"\nrock_vertex_"<<i<<"_local_z_m,"<<p.local[i].z<<'\n';
+    const DynamicArray<Point>& points=hill.getPoints();
+    for(size_t i=0;i<points.size();++i) config<<"terrain_point_"<<i<<"_x_m,"<<points[i].x<<"\nterrain_point_"<<i<<"_z_m,"<<points[i].z<<'\n';
+    trace.flush(); summary.flush(); config.flush();
+    if(!trace || !summary || !config) throw std::runtime_error("CSV write failed (check disk space and permissions).");
+}
+
+struct PhysicsParameterGuard {
+    double drag,mu,e,roll;
+    PhysicsParameterGuard() : drag(g_dragCoef),mu(g_slideFriction),e(g_restitution),roll(g_rollResist) {}
+    ~PhysicsParameterGuard() { g_dragCoef=drag; g_slideFriction=mu; g_restitution=e; g_rollResist=roll; }
+};
+struct BarrierScenarioResult { double deflection,finalX,loss,maxPenetration; bool touched,passed; };
+BarrierScenarioResult runBarrierScenario(double dt,bool enabled,double stiffness,const std::string& output="",double initialSpeed=12) {
+    PhysicsParameterGuard guard; g_dragCoef=0; g_slideFriction=0.15; g_restitution=0; g_rollResist=0.02;
+    DynamicArray<Point> points; points.push_back(Point(-50,0)); points.push_back(Point(100,0)); HillSlope hill(points);
+    double a=sqrt(0.5); std::vector<Point> corners;
+    corners.push_back(Point(-a,-a)); corners.push_back(Point(a,-a)); corners.push_back(Point(a,a)); corners.push_back(Point(-a,a));
+    PolygonShape shape(corners,1); RollingStone stone(1,0,shape); stone.adjustToGround(hill); stone.startAlongSlope(hill,initialSpeed);
+    BarrierSettings settings; settings.enabled=enabled; settings.x=8; settings.height=6; settings.stiffness=stiffness;
+    ElasticBarrier barrier; barrier.reset(hill,settings); std::vector<TrialSample> samples;
+    if(!output.empty()) recordSample(samples,0,stone,barrier);
+    double maxPenetration=0;
+    int steps=(int)ceil(12.0/dt);
+    for(int i=0;i<steps;++i) {
+        stone.update(hill,dt,&barrier);
+        maxPenetration=max(maxPenetration,stone.penetration(hill));
+        if(!output.empty()) recordSample(samples,(i+1)*dt,stone,barrier);
+        if(stone.getEnergy()+barrier.energy()>1e10) throw std::runtime_error("Unbounded scenario energy");
+    }
+    if(!output.empty()) exportTrial(output,samples,stone,barrier,hill,"fixed_12s",true);
+    return BarrierScenarioResult{barrier.maxDisplacement(),stone.getX(),barrier.dampingEnergy()+barrier.impactEnergy(),
+        maxPenetration,barrier.hasContact(),barrier.hasPassed()};
+}
+
+int barrierSelfTest() {
+    try {
+        PhysicsParameterGuard guard;
+        DynamicArray<Point> points; points.push_back(Point(-100,0)); points.push_back(Point(100,0)); HillSlope hill(points);
+        BarrierSettings settings; settings.x=8; ElasticBarrier barrier; barrier.reset(hill,settings);
+        // 单独弹簧阻尼系统的离散能量恒等式：物理阻尼和后向 Euler 耗散分别核对。
+        barrier.applyImpulse(2000); double initial=barrier.energy(),previous=initial;
+        for(int i=0;i<6000;++i) {
+            barrier.beginStep(0.001); barrier.endStep(0.001);
+            requireTest(barrier.energy()<=previous+1e-8,"oscillator energy cannot grow"); previous=barrier.energy();
+        }
+        requireTest(fabs(initial-barrier.energy()-barrier.dampingEnergy()-barrier.numericalEnergy())<1e-7,"spring damping energy identity");
+        requireTest(barrier.energy()<1e-6,"damped support settles");
+        // 单次中心碰撞有解析解，检验水平动量、相对速度、冲量以及碰撞耗能。
+        std::mt19937 rng(7); PolygonShape shape=generatePolygon(4,1,2,rng);
+        RollingStone body(0,5,shape); body.vx=10;
+        barrier.reset(hill,settings);
+        RollingStone::Contact central={Point(0,0),Point(-1,0),0,0,0,0,true};
+        double momentum=body.shape.mass*body.vx, before=body.getEnergy()+barrier.kineticEnergy();
+        double j=-body.contactVelocity(central,central.normal,&barrier)/body.effectiveMass(central,central.normal,&barrier);
+        body.impulse(central,central.normal,j,&barrier);
+        double reduced=1/(1/body.shape.mass+1/settings.mass);
+        requireTest(fabs(body.shape.mass*body.vx+settings.mass*barrier.speed()-momentum)<1e-8,"pair horizontal momentum");
+        requireTest(fabs(body.vx-barrier.speed())<1e-10,"inelastic relative normal velocity");
+        requireTest(fabs(before-body.getEnergy()-barrier.kineticEnergy()-0.5*reduced*100)<1e-7,"analytic impact energy");
+        requireTest(fabs(barrier.impactEnergy()-0.5*reduced*100)<1e-7,"reported contact loss");
+        // 非中心冲量必须产生正确角速度。
+        RollingStone offset(0,5,shape); offset.vx=10; barrier.reset(hill,settings);
+        central.arm=Point(0,0.4);
+        j=-offset.contactVelocity(central,central.normal,&barrier)/offset.effectiveMass(central,central.normal,&barrier);
+        offset.impulse(central,central.normal,j,&barrier);
+        requireTest(fabs(offset.omega-0.4*j/shape.inertia)<1e-10,"off-centre angular impulse");
+        // 网段端点落在多边形边内时也应检测到；完全高于挡板则不接触。
+        settings.height=0.5; barrier.reset(hill,settings);
+        std::vector<Point> square; double a=sqrt(0.5);
+        square.push_back(Point(-a,-a)); square.push_back(Point(a,-a)); square.push_back(Point(a,a)); square.push_back(Point(-a,a));
+        PolygonShape aligned(square,1); RollingStone endpoint(7.6,0.25,aligned);
+        std::vector<RollingStone::Contact> cc=endpoint.contacts(hill,0,&barrier); bool found=false;
+        for(size_t i=0;i<cc.size();++i) if(cc[i].barrier) found=true;
+        requireTest(found,"finite panel edge/endpoint contact");
+        RollingStone above(7.6,3,aligned); cc=above.contacts(hill,0,&barrier);
+        for(size_t i=0;i<cc.size();++i) requireTest(!cc[i].barrier,"above-panel bypass");
+        // 实际越顶通过不能触发接触或向挡板注入能量。
+        settings.height=6; barrier.reset(hill,settings); g_dragCoef=0;
+        RollingStone overTop(6,15,aligned); overTop.vx=12;
+        for(int i=0;i<250;++i) overTop.update(hill,DT,&barrier);
+        requireTest(barrier.hasPassed() && !barrier.hasContact() && barrier.energy()==0,"above-panel passage result");
+        // 完整耦合系统能量核对（空中撞击，不受地面作用）。重力积分有小量数值耗散。
+        barrier.reset(hill,settings); settings.height=30; barrier.reset(hill,settings);
+        RollingStone aerial(1,15,aligned); aerial.vx=12;
+        double startEnergy=aerial.getEnergy()+aerial.getMass()*GRAVITY*aerial.getZ();
+        double worstBudget=0;
+        for(int i=0;i<600;++i) {
+            aerial.update(hill,DT,&barrier);
+            double accounted=aerial.getEnergy()+aerial.getMass()*GRAVITY*aerial.getZ()+barrier.energy()+
+                barrier.dampingEnergy()+barrier.numericalEnergy()+barrier.impactEnergy();
+            requireTest(accounted<=startEnergy+0.000001*startEnergy,"coupled energy cannot be created");
+            worstBudget=max(worstBudget,fabs(accounted-startEnergy)/startEnergy);
+        }
+        requireTest(barrier.hasContact() && worstBudget<0.005,"coupled energy accounting within 0.5 percent");
+        bool invalidRejected=false; BarrierSettings invalid=settings; invalid.mass=-1;
+        try { ElasticBarrier::validate(invalid,hill); } catch(const std::exception&) { invalidRejected=true; }
+        requireTest(invalidRejected,"invalid barrier mass rejected");
+        // 关闭挡板必须与旧算法逐步一致。
+        settings.enabled=false; barrier.reset(hill,settings);
+        RollingStone old(0,5,aligned),disabled=old;
+        for(int i=0;i<2000;++i) { old.update(hill,DT); disabled.update(hill,DT,&barrier); }
+        requireTest(old.x==disabled.x && old.z==disabled.z && old.vx==disabled.vx && old.vz==disabled.vz && old.omega==disabled.omega,"disabled barrier preserves baseline");
+        BarrierScenarioResult coarse=runBarrierScenario(0.002,true,500000);
+        BarrierScenarioResult medium=runBarrierScenario(0.001,true,500000);
+        BarrierScenarioResult fine=runBarrierScenario(0.0005,true,500000);
+        BarrierScenarioResult baseline=runBarrierScenario(0.002,false,500000);
+        requireTest(coarse.touched && coarse.deflection>0.01 && !coarse.passed,"elastic panel deflects and blocks");
+        requireTest(baseline.finalX>15 && coarse.finalX<12,"on/off interception difference");
+        double relative=fabs(coarse.deflection-fine.deflection)/fine.deflection;
+        requireTest(relative<0.05,"deflection timestep convergence within 5 percent");
+        requireTest(fabs(medium.deflection-fine.deflection)<=fabs(coarse.deflection-fine.deflection)+0.0005,"refining timestep improves deflection");
+        requireTest(max(coarse.maxPenetration,fine.maxPenetration)<0.01,"coupled ground penetration");
+        BarrierScenarioResult fast=runBarrierScenario(0.002,true,500000,"",60);
+        requireTest(fast.touched && !fast.passed,"fast impact does not tunnel through panel");
+        std::printf("PASS elastic barrier: oscillator energy identity, analytic impact momentum/energy, off-centre torque, finite-height contact, actual bypass, coupled energy budget, invalid input, disabled baseline, interception, high-speed contact and timestep convergence.\n");
+        std::printf("coupled aerial energy budget residual (gravity integration included): %.6g%%\n",100*worstBudget);
+        std::printf("max deflection: dt=.002 %.9g m, dt=.001 %.9g m, dt=.0005 %.9g m; coarse/fine error=%.6g%%; baseline x=%.9g, barrier x=%.9g\n",
+            coarse.deflection,medium.deflection,fine.deflection,100*relative,baseline.finalX,coarse.finalX);
+        return 0;
+    } catch(const std::exception& e) { std::fprintf(stderr,"FAIL elastic barrier: %s\n",e.what()); return 1; }
+}
+
+int barrierDemo() {
+    try {
+        if(!CreateDirectoryA("results",nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS)
+            throw std::runtime_error("Cannot create results directory");
+        runBarrierScenario(DT,false,500000,"results/barrier_demo_off");
+        runBarrierScenario(DT,true,500000,"results/barrier_demo_on");
+        runBarrierScenario(DT,true,1000000,"results/barrier_demo_stiffer");
+        std::printf("Exported three controlled 12-second flat-ground scenarios (same polygon, initial state and ground) to results/barrier_demo_*.csv\n");
+        return 0;
+    } catch(const std::exception& e) { std::fprintf(stderr,"Demo failed: %s\n",e.what()); return 1; }
+}
+
+
 // ------------------------------------------------------------------ 主程序
 int main(int argc, char** argv)
 {
-    if(argc>1 && std::strcmp(argv[1],"--self-test")==0) return polygonSelfTest();
+    if(argc>1 && std::strcmp(argv[1],"--self-test")==0) { int code=polygonSelfTest(); return code?code:barrierSelfTest(); }
+    if(argc>1 && std::strcmp(argv[1],"--barrier-test")==0) return barrierSelfTest();
+    if(argc>1 && std::strcmp(argv[1],"--barrier-demo")==0) return barrierDemo();
 	initgraph(WIDTH, HEIGHT);
 	setbkcolor(RGB(135, 206, 235));
     SetWindowText(GetHWnd(),_T("Rolling Stone - Convex Polygon"));
@@ -952,6 +1290,10 @@ int main(int argc, char** argv)
     }
     RollingStone stone((double)initX,initZ,initial);
     stone.adjustToGround(hill); stone.startAlongSlope(hill,stoneSpeed);
+    RollingStone trialStart=stone; // B/V 重跑时复用同一块石头，不重新随机形状。
+    BarrierSettings barrierSettings;
+    barrierSettings.x=max((double)hill.getStartX()+2.0,(double)hill.getEndX()-12.0);
+    ElasticBarrier barrier; barrier.reset(hill,barrierSettings);
 	bool simEnded = false;
 
 	bool paused = false;
@@ -974,6 +1316,25 @@ int main(int argc, char** argv)
 	DynamicArray<TimeSpeed> speedData;
 	double simTime = 0.0;
 	const double graphWindow = 10.0;
+    std::vector<TrialSample> trialSamples; recordSample(trialSamples,0,stone,barrier);
+    bool autoExported=false;
+    std::string endReason="running", lastExport;
+    auto restartTrial=[&]() {
+        stone=trialStart; barrier.reset(hill,barrierSettings);
+        paused=false; simEnded=false; inMenu=false; inPauseMenu=false;
+        stoppedDuration=0; stoppedTriggered=false; speedData.clear(); simTime=0;
+        autoExported=false; endReason="running"; trialSamples.clear(); lastExport.clear();
+        recordSample(trialSamples,0,stone,barrier);
+    };
+    auto saveTrial=[&]() {
+        if(!CreateDirectoryA("results",nullptr) && GetLastError()!=ERROR_ALREADY_EXISTS)
+            throw std::runtime_error("Cannot create results directory");
+        SYSTEMTIME now; GetLocalTime(&now); char prefix[180];
+        std::snprintf(prefix,sizeof(prefix),"results/trial_%04u%02u%02u_%02u%02u%02u_%03u_%lu",
+            now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,now.wMilliseconds,(unsigned long)GetTickCount());
+        exportTrial(prefix,trialSamples,stone,barrier,hill,endReason.c_str(),simEnded);
+        lastExport=prefix;
+    };
 
 	settextstyle(16, 0, _T("Consolas"));
 	setcolor(RGB(50, 50, 50));
@@ -1014,6 +1375,15 @@ int main(int argc, char** argv)
 					inPauseMenu = false;
 				}
 			}
+            if(key=='b' || key=='B') {
+                BarrierSettings candidate=barrierSettings;
+                if(readBarrierSettings(candidate,hill)) { barrierSettings=candidate; restartTrial(); }
+            }
+            if(key=='v' || key=='V') { barrierSettings.enabled=!barrierSettings.enabled; restartTrial(); }
+            if(key=='e' || key=='E') {
+                try { saveTrial(); MessageBoxA(GetHWnd(),lastExport.c_str(),"CSV exported (trajectory / summary / config)",MB_OK); }
+                catch(const std::exception& e) { MessageBoxA(GetHWnd(),e.what(),"CSV export failed",MB_OK|MB_ICONWARNING); }
+            }
             if(key=='r' || key=='R' || key=='g' || key=='G')
             {
                 ShapeSettings candidate=shapeSettings;
@@ -1023,8 +1393,7 @@ int main(int argc, char** argv)
                     stone=RollingStone((double)initX,initZ,generated);
                     stone.adjustToGround(hill); stone.startAlongSlope(hill,stoneSpeed);
                     shapeSettings=candidate;
-                    paused=false; simEnded=false; inMenu=false; inPauseMenu=false;
-                    stoppedDuration=0; stoppedTriggered=false; speedData.clear(); simTime=0;
+                    trialStart=stone; restartTrial();
                 } catch(const std::exception& e) {
                     MessageBoxA(GetHWnd(),e.what(),"Shape generation failed - previous shape retained",MB_OK|MB_ICONWARNING);
                 }
@@ -1038,16 +1407,15 @@ int main(int argc, char** argv)
                     try
                     {
                         HillSlope newHill = (choice == 2) ? HillSlope() : HillSlope(buildTerrain(terrainSettings));
-                        hill = newHill;
-                        initX = hill.getPeakX();
-                        initZ = hill.getHeight((double)initX);
-
-                        stone = RollingStone((double)initX, initZ, generatePolygon(shapeSettings, shapeRng));
-                        stone.adjustToGround(hill);
-                        stone.startAlongSlope(hill, stoneSpeed);
-
-                        paused = false; simEnded = false; inMenu = false; inPauseMenu = false;
-                        stoppedDuration = 0; stoppedTriggered = false; speedData.clear(); simTime = 0;
+                        // 先完成可能失败的构造，再提交地形变更，避免半更新状态。
+                        int newX=newHill.getPeakX(); double newZ=newHill.getHeight(newX);
+                        RollingStone newStone((double)newX,newZ,generatePolygon(shapeSettings,shapeRng));
+                        newStone.adjustToGround(newHill); newStone.startAlongSlope(newHill,stoneSpeed);
+                        BarrierSettings newBarrier=barrierSettings;
+                        newBarrier.x=max((double)newHill.getStartX()+2.0,(double)newHill.getEndX()-12.0);
+                        ElasticBarrier::validate(newBarrier,newHill);
+                        hill=newHill; initX=newX; initZ=newZ; barrierSettings=newBarrier;
+                        trialStart=newStone; restartTrial();
                     }
                     catch (const std::exception& e)
                     {
@@ -1105,6 +1473,12 @@ int main(int argc, char** argv)
 						g_playbackFactor = playbackOptions[playbackIndex];
 					}
 				}
+                if((key=='a'||key=='A'||key=='d'||key=='D') && menuSel<4) {
+                    stone=trialStart; barrier.reset(hill,barrierSettings);
+                    simEnded=false; stoppedDuration=0; stoppedTriggered=false; simTime=0;
+                    speedData.clear(); trialSamples.clear(); recordSample(trialSamples,0,stone,barrier);
+                    autoExported=false; lastExport.clear(); endReason="running";
+                }
                 if(key=='a'||key=='A'||key=='d'||key=='D') {
                     std::snprintf(inputBuf[0],32,"%.3f",g_rollResist);
                     std::snprintf(inputBuf[1],32,"%.3f",g_slideFriction);
@@ -1125,12 +1499,15 @@ int main(int argc, char** argv)
 			int steps = STEPS_PER_FRAME * g_playbackFactor;
 			for (int i = 0; i < steps; ++i)
 			{
-                try { stone.update(hill, DT); }
+                try {
+                    stone.update(hill,DT,&barrier);
+                    simTime+=DT; recordSample(trialSamples,simTime,stone,barrier);
+                }
                 catch(const std::exception& e) {
-                    paused=true; simEnded=true;
+                    paused=true; simEnded=true; endReason="solver_error";
                     MessageBoxA(GetHWnd(),e.what(),"Simulation stopped",MB_OK|MB_ICONWARNING); break;
                 }
-				simTime += DT;
+                if(simTime>=180) { simEnded=true; paused=true; endReason="time_limit_180s"; break; }
 			}
 			double curSpeed = stone.getSpeed();
 			speedData.push_back(TimeSpeed(simTime, curSpeed));
@@ -1141,29 +1518,36 @@ int main(int argc, char** argv)
 
 			if (!simEnded)
 			{
-				if (stone.getX() >= hill.getEndX() - 0.5)
+				if (stone.getX() >= max((double)hill.getEndX()-0.5,
+                    barrier.enabled()?barrier.faceX()+stone.getShape().extent+1.0:(double)hill.getEndX()-0.5))
 				{
-                    simEnded=true; paused=true;
+                    simEnded=true; paused=true; endReason="downstream_boundary";
 				}
 			}
 
 			if (!stoppedTriggered && !simEnded)
 			{
-				if (!stone.isMoving())
+				if (!stone.isMoving() && barrier.settled())
 					stoppedDuration += STEPS_PER_FRAME * DT * g_playbackFactor;
 				else
 					stoppedDuration = 0.0;
 				if (stoppedDuration >= 3.0)
 				{
-                    simEnded=true; paused=true;
+                    simEnded=true; paused=true; endReason="settled_3s";
 				}
 			}
 
+            }
+            if(simEnded && !autoExported) {
+                autoExported=true;
+                try { saveTrial(); }
+                catch(const std::exception& e) { MessageBoxA(GetHWnd(),e.what(),"Automatic CSV export failed - press E to retry",MB_OK|MB_ICONWARNING); }
             }
 			cleardevice();
 			setbkcolor(RGB(135, 206, 235));
 
 			hill.draw();
+            barrier.draw();
 			if (inMenu)
 			{
 				setfillcolor(RGB(240, 240, 240));
@@ -1241,8 +1625,16 @@ int main(int argc, char** argv)
             formatText(geometryInfo,200,_T("k=%d  r=%.4g m  S=%.8g m2  omega=%.3f rad/s"),stone.getSides(),stone.getRadius(),stone.getArea(),stone.getOmega());
             settextstyle(16,0,_T("Consolas")); setcolor(RGB(20,30,50));
             outtextxy(10,10,geometryInfo);
-            outtextxy(10,32,_T("SPACE:pause  R:new polygon  G:geometry  T:terrain  M:physics  ESC:exit"));
+            outtextxy(10,32,_T("SPACE:pause R:polygon G:shape T:terrain M:physics B:barrier V:on/off E:CSV ESC:exit"));
 
+            TCHAR barrierInfo[240]; settextstyle(14,0,_T("Consolas")); setcolor(RGB(10,40,90));
+            formatText(barrierInfo,240,_T("Barrier %s  q=%.4f m  max|q|=%.4f m  support=%.2f kN"),
+                barrier.enabled()?_T("ON"):_T("OFF"),barrier.displacement(),barrier.maxDisplacement(),barrier.supportForce()/1000);
+            outtextxy(10,56,barrierInfo);
+            formatText(barrierInfo,240,_T("Damper=%.3f kJ  numerical=%.3f kJ  contact=%.3f kJ  hit:%d passed:%d"),
+                barrier.dampingEnergy()/1000,barrier.numericalEnergy()/1000,barrier.impactEnergy()/1000,barrier.hasContact(),barrier.hasPassed());
+            outtextxy(10,76,barrierInfo);
+            if(!lastExport.empty()) outtextxy(10,96,_T("CSV saved in results/ (summary + trajectory + config)"));
 			// -------- HUD（米制） --------
 			TCHAR info[200];
 			setcolor(RGB(255, 255, 255));
@@ -1404,7 +1796,7 @@ int main(int argc, char** argv)
 		{
 			setcolor(RGB(0, 255, 0));
 			settextstyle(16, 0, _T("Consolas"));
-			outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Ended: R=new polygon, G=geometry, T=terrain"));
+			outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Ended: E=CSV, V=compare on/off, R=new polygon"));
 		}
 	}
 

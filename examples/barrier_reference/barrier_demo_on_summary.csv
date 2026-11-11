@@ -1,0 +1,2 @@
+outcome,termination,time_s,contacted,passed,max_abs_deflection_m,peak_support_force_N,peak_substep_average_contact_force_N,damper_loss_J,numerical_loss_J,contact_loss_J,final_rock_x_m,final_rock_speed_m_s,final_barrier_energy_J
+blocked_at_rest,fixed_12s,12,1,0,0.67182742088642,387947.886985813,16180629.2683169,180045.589019719,8328.84291637986,95331.5684911653,2.53008399332407,0,2.03325258799331e-69
