@@ -439,6 +439,81 @@ PolygonShape generatePolygon(const ShapeSettings& c, std::mt19937& rng)
     return generatePolygon(sides(rng),c.r,c.area,rng);
 }
 
+// ------------------------------------------------------------------ 参数化地形
+struct TerrainSettings      //地形参数：用几个数字描述一条山坡
+{
+    double topHeight = 55.6;      //坡顶高度（m）
+    double steepDeg = 40.0;      //陡坡段坡角（度）
+    double benchStart = 25.0;      //缓台起点离坡顶的水平距离（m）
+    double benchLength = 15.0;      //缓台水平长度（m），0 表示没有缓台
+    double benchDeg = 7.0;      //缓台坡角（度）
+    double toeLength = 20.0;      //坡脚平台长度（m）
+};
+
+const double TERRAIN_MAX_LENGTH = 120.0;      //地形最大水平长度（m），窗口宽 125 m
+
+DynamicArray<Point> buildTerrain(const TerrainSettings& t)      //按地形参数生成山坡折线的控制点
+{
+    if (!std::isfinite(t.topHeight) || t.topHeight < 5 || t.topHeight > 60)
+    {
+        throw std::runtime_error("Top height must be between 5 and 60 m.");
+    }
+
+    if (!std::isfinite(t.steepDeg) || t.steepDeg < 15 || t.steepDeg > 70)
+    {
+        throw std::runtime_error("Steep slope angle must be between 15 and 70 degrees.");
+    }
+
+    if (!std::isfinite(t.benchDeg) || t.benchDeg < 0 || t.benchDeg >= t.steepDeg)
+    {
+        throw std::runtime_error("Bench angle must be >= 0 and smaller than the steep slope angle.");
+    }
+
+    if (!std::isfinite(t.benchStart) || !std::isfinite(t.benchLength) || !std::isfinite(t.toeLength)
+        || t.benchStart < 0 || t.benchLength < 0 || t.toeLength < 5)
+    {
+        throw std::runtime_error("Bench start/length must be >= 0 and toe length must be >= 5 m.");
+    }
+
+    double steepTan = tan(t.steepDeg * POLY_PI / 180);
+    double benchTan = tan(t.benchDeg * POLY_PI / 180);
+
+    double benchStartZ = t.topHeight - t.benchStart * steepTan;
+    double benchEndX = t.benchStart + t.benchLength;
+    double benchEndZ = benchStartZ - t.benchLength * benchTan;
+
+    if (benchEndZ < 1)
+    {
+        throw std::runtime_error("The bench must end at least 1 m above the toe; move it up or shorten it.");
+    }
+
+    double footX = benchEndX + benchEndZ / steepTan;
+    double endX = footX + t.toeLength;
+
+    if (endX > TERRAIN_MAX_LENGTH)
+    {
+        throw std::runtime_error("Terrain is longer than 120 m; use a steeper slope or shorter segments.");
+    }
+
+    DynamicArray<Point> p;
+    p.push_back(Point(0.0, t.topHeight));
+
+    if (t.benchStart > 0)
+    {
+        p.push_back(Point(t.benchStart, benchStartZ));
+    }
+
+    if (t.benchLength > 0)
+    {
+        p.push_back(Point(benchEndX, benchEndZ));
+    }
+
+    p.push_back(Point(footX, 0.0));
+    p.push_back(Point(endX, 0.0));
+
+    return p;
+}
+
 // ------------------------------------------------------------------ 多边形刚体与静态折线的接触
 class RollingStone
 {
@@ -611,6 +686,82 @@ bool readShapeSettings(ShapeSettings& settings)
         }
     }
 }
+int readTerrainSettings(TerrainSettings& settings)      //弹出输入框读地形参数：0 取消，1 自定义地形，2 恢复原始地形
+{
+    for (;;)
+    {
+        TCHAR buf[200], defaults[200];
+        formatText(defaults, 200, _T("%.6g %.6g %.6g %.6g %.6g %.6g"),
+            settings.topHeight, settings.steepDeg, settings.benchStart,
+            settings.benchLength, settings.benchDeg, settings.toeLength);
+
+        if (!InputBox(buf, 200, _T("依次输入：坡顶高度H(m) 陡坡角(度) 缓台起点(m) 缓台长度(m) 缓台坡角(度) 坡脚平台长度(m)\n例如：55.6 40 25 15 7 20\nH为5~60；陡坡角15~70；缓台坡角小于陡坡角；缓台长度填0表示没有缓台；总长不超过120m。\n只输入 0 恢复老师给的原始地形。"),
+            _T("地形参数"), defaults, 700, 290, false))
+        {
+            return 0;
+        }
+
+        TCHAR* cursor = buf;
+
+        while (*cursor == _T(' ') || *cursor == _T('\t'))
+        {
+            ++cursor;
+        }
+
+        if (cursor[0] == _T('0') && cursor[1] == 0)
+        {
+            return 2;
+        }
+
+        double values[6];
+        bool valid = true;
+
+        for (int i = 0; i < 6; ++i)
+        {
+            TCHAR* end = cursor;
+            errno = 0;
+            values[i] = _tcstod(cursor, &end);
+
+            if (end == cursor || errno == ERANGE || !std::isfinite(values[i]))
+            {
+                valid = false;
+            }
+
+            cursor = end;
+        }
+
+        while (*cursor == _T(' ') || *cursor == _T('\t'))
+        {
+            ++cursor;
+        }
+
+        if (*cursor || !valid)
+        {
+            MessageBox(GetHWnd(), _T("请输入六个有效数字，用空格隔开。"), _T("输入错误"), MB_OK);
+            continue;
+        }
+
+        TerrainSettings candidate;
+        candidate.topHeight = values[0];
+        candidate.steepDeg = values[1];
+        candidate.benchStart = values[2];
+        candidate.benchLength = values[3];
+        candidate.benchDeg = values[4];
+        candidate.toeLength = values[5];
+
+        try
+        {
+            buildTerrain(candidate);
+            settings = candidate;
+            return 1;
+        }
+        catch (const std::exception& e)
+        {
+            MessageBoxA(GetHWnd(), e.what(), "Terrain parameters out of range", MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
 void requireTest(bool ok,const char* text) { if(!ok) throw std::runtime_error(text); }
 int polygonSelfTest()
 {
@@ -712,6 +863,53 @@ int polygonSelfTest()
                 requireTest(cross2(minus2(b,a),minus2(c,b))>0,"extreme area convexity");
             }
         }
+        TerrainSettings terrainDefault;
+        DynamicArray<Point> terrainPoints = buildTerrain(terrainDefault);
+        requireTest(fabs(terrainPoints[0].z - terrainDefault.topHeight) < 1e-12, "terrain top height");
+        requireTest(fabs(terrainPoints[terrainPoints.size() - 1].z) < 1e-12, "terrain toe height");
+        requireTest(terrainPoints[terrainPoints.size() - 1].x <= TERRAIN_MAX_LENGTH, "terrain length");
+
+        for (size_t i = 1; i < terrainPoints.size(); ++i)
+        {
+            requireTest(terrainPoints[i].x > terrainPoints[i - 1].x, "terrain x increases");
+            requireTest(terrainPoints[i].z <= terrainPoints[i - 1].z, "terrain goes downhill");
+        }
+
+        TerrainSettings terrainNoBench;
+        terrainNoBench.benchLength = 0;
+        requireTest(buildTerrain(terrainNoBench).size() == 4, "terrain without bench");
+
+        TerrainSettings terrainBad;
+        terrainBad.steepDeg = 80;
+        bool terrainRejected = false;
+
+        try
+        {
+            buildTerrain(terrainBad);
+        }
+        catch (...)
+        {
+            terrainRejected = true;
+        }
+
+        requireTest(terrainRejected, "invalid terrain rejected");
+
+        HillSlope customHill(terrainPoints);
+
+        for (int j = 0; j < 6; ++j)
+        {
+            PolygonShape p = generatePolygon(ShapeSettings{3, 8, 2, 3}, rng);
+            RollingStone body(customHill.getPeakX(), customHill.getHeight(customHill.getPeakX()), p);
+            body.adjustToGround(customHill);
+            body.startAlongSlope(customHill, 1.5);
+
+            for (int i = 0; i < 20000 && body.isMoving() && body.getX() < customHill.getEndX(); ++i)
+            {
+                body.update(customHill, DT);
+                maxPen = max(maxPen, body.penetration(customHill));
+            }
+        }
+
         requireTest(maxPen<0.01,"slope penetration");
         std::printf("PASS: 300 random geometries + 1100 samples for input 10 20 7 20, area/radius/convexity, inertia, invalid input, restitution, free fall, ridge contact, regular limit, deterministic seed, drop/rest, 23 slope trajectories and 84 extreme-area samples. Max area/r^2 error=%.3g; max penetration=%.6g m\n",worstArea,maxPen);
         return 0;
@@ -735,6 +933,15 @@ int main(int argc, char** argv)
     std::mt19937 shapeRng((unsigned int)GetTickCount() ^ (unsigned int)GetCurrentProcessId());
     if(!readShapeSettings(shapeSettings)) { EndBatchDraw(); closegraph(); return 0; }
     double stoneSpeed=1.5;
+    TerrainSettings terrainSettings;      //当前地形参数（按 T 修改）
+
+    if (readTerrainSettings(terrainSettings) == 1)
+    {
+        hill = HillSlope(buildTerrain(terrainSettings));
+        initX = hill.getPeakX();
+        initZ = hill.getHeight((double)initX);
+    }
+
     PolygonShape initial=generatePolygon(3,2,3,shapeRng);
     for(;;) {
         try { initial=generatePolygon(shapeSettings,shapeRng); break; }
@@ -771,7 +978,7 @@ int main(int argc, char** argv)
 	settextstyle(16, 0, _T("Consolas"));
 	setcolor(RGB(50, 50, 50));
 	outtextxy(10, 20, _T("Convex polygon rigid body - SI units; thickness=1 m"));
-	outtextxy(10, 45, _T("SPACE=Pause M=Physics R=New polygon G=Geometry ESC=Exit"));
+	outtextxy(10, 45, _T("SPACE=Pause M=Physics R=New polygon G=Geometry T=Terrain ESC=Exit"));
 
 	while (true)
 	{
@@ -820,6 +1027,32 @@ int main(int argc, char** argv)
                     stoppedDuration=0; stoppedTriggered=false; speedData.clear(); simTime=0;
                 } catch(const std::exception& e) {
                     MessageBoxA(GetHWnd(),e.what(),"Shape generation failed - previous shape retained",MB_OK|MB_ICONWARNING);
+                }
+            }
+            if (key == 't' || key == 'T')
+            {
+                int choice = readTerrainSettings(terrainSettings);
+
+                if (choice != 0)
+                {
+                    try
+                    {
+                        HillSlope newHill = (choice == 2) ? HillSlope() : HillSlope(buildTerrain(terrainSettings));
+                        hill = newHill;
+                        initX = hill.getPeakX();
+                        initZ = hill.getHeight((double)initX);
+
+                        stone = RollingStone((double)initX, initZ, generatePolygon(shapeSettings, shapeRng));
+                        stone.adjustToGround(hill);
+                        stone.startAlongSlope(hill, stoneSpeed);
+
+                        paused = false; simEnded = false; inMenu = false; inPauseMenu = false;
+                        stoppedDuration = 0; stoppedTriggered = false; speedData.clear(); simTime = 0;
+                    }
+                    catch (const std::exception& e)
+                    {
+                        MessageBoxA(GetHWnd(), e.what(), "Terrain change failed - previous terrain retained", MB_OK | MB_ICONWARNING);
+                    }
                 }
             }
 			if (key == 'm' || key == 'M')
@@ -1008,7 +1241,7 @@ int main(int argc, char** argv)
             formatText(geometryInfo,200,_T("k=%d  r=%.4g m  S=%.8g m2  omega=%.3f rad/s"),stone.getSides(),stone.getRadius(),stone.getArea(),stone.getOmega());
             settextstyle(16,0,_T("Consolas")); setcolor(RGB(20,30,50));
             outtextxy(10,10,geometryInfo);
-            outtextxy(10,32,_T("SPACE:pause  R:new polygon  G:geometry  M:physics  ESC:exit"));
+            outtextxy(10,32,_T("SPACE:pause  R:new polygon  G:geometry  T:terrain  M:physics  ESC:exit"));
 
 			// -------- HUD（米制） --------
 			TCHAR info[200];
@@ -1171,7 +1404,7 @@ int main(int argc, char** argv)
 		{
 			setcolor(RGB(0, 255, 0));
 			settextstyle(16, 0, _T("Consolas"));
-			outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Ended: R=new polygon, G=geometry"));
+			outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Ended: R=new polygon, G=geometry, T=terrain"));
 		}
 	}
 
