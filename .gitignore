@@ -1,0 +1,23 @@
+# Visual Studio local state
+.vs/
+*.user
+*.suo
+
+# Build output
+build/
+x64/
+x86/
+Debug/
+Release/
+*.exe
+*.obj
+*.o
+*.pdb
+*.idb
+*.ilk
+*.tlog
+*.log
+
+# Local backups
+*.bak
+graphics_winbgim_backup.h

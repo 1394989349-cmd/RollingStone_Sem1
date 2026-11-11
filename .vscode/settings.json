@@ -1,0 +1,6 @@
+{
+    "code-runner.executorMap": {
+        "cpp": "cd $dir && C:/MinGW/bin/g++ $fileName -Wall -std=c++11 -fexec-charset=GBK -o $fileNameWithoutExt -leasyx && $dir$fileNameWithoutExt"
+    },
+    "code-runner.runInTerminal": true
+}

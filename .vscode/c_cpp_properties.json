@@ -1,0 +1,20 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "defines": [
+        "WINVER=0x0500",
+        "_WIN32_WINNT=0x0500"
+      ],
+      "compilerPath": "C:/MinGW/bin/g++.exe",
+      "intelliSenseMode": "windows-gcc-x86",
+      "name": "EasyX MinGW 32-bit",
+      "cppStandard": "c++11",
+      "cStandard": "c17",
+      "includePath": [
+        "C:/MinGW/include",
+        "${workspaceFolder}/**"
+      ]
+    }
+  ]
+}
