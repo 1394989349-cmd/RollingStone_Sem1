@@ -16,6 +16,11 @@
 #include <cstdio>
 #include <algorithm>
 #include <cwchar>
+#include <vector>
+#include <random>
+#include <stdexcept>
+#include <limits>
+#include <cerrno>
 using namespace std;
 template <typename... Args>
 int formatText(TCHAR* buffer, size_t capacity, const TCHAR* format, Args... args)
@@ -35,12 +40,10 @@ int formatText(TCHAR* buffer, size_t capacity, const TCHAR* format, Args... args
 //  ---------------------------------------------------------------
 //  物理量全部用国际单位制：位置 m、速度 m/s、时间 s、质量 kg、能量 J
 //  只有在“画图”这一步才换算成像素，换算比例 PX_PER_M
-//  物理模型：
-//    · 触地滚动：a = (5/7) g sinθ − c_rr g cosθ − 空气阻力      （实心球纯滚动）
-//    · 陡坡打滑：tanθ > μ 时摩擦不足以维持纯滚动，改用 a = g(sinθ − μcosθ)
-//    · 空中飞行：竖直重力 + 二次空气阻力 ½ρCdAv²
-//    · 碰撞弹跳：法向恢复系数 e，切向按库仑冲量损失
-//    · 停止：速度足够小且坡度小于摩擦角（不规则块体被地面抓住）
+//  刚体模型：均匀凸多边形沿屏幕法向挤出 1m；质量=rho*S*1m。
+//  使用真实质心、极惯性矩、接触点冲量、库仑摩擦和恢复系数。
+//  地形是静态折线；这是二维数值近似，不包括破碎、三维翻滚和材料变形。
+//  接触求解采用固定步长、子步和迭代冲量；参考 https://box2d.org/documentation/md_simulation.html
 // ============================================================================
 
 // ------------------------------------------------------------------ 画面
@@ -217,18 +220,8 @@ public:
 	// 指定 x 处的坡角 θ（弧度，>0 表示顺坡向下）
 	double getSlopeAngle(double x) const
 	{
-		if (x <= points[0].x)
-		{
-			double dz = points[1].z - points[0].z;
-			double dx = points[1].x - points[0].x;
-			return -atan2(dz, dx);
-		}
-		if (x >= points[points.size() - 1].x)
-		{
-			double dz = points[points.size() - 1].z - points[points.size() - 2].z;
-			double dx = points[points.size() - 1].x - points[points.size() - 2].x;
-			return -atan2(dz, dx);
-		}
+        if(x < points[0].x) return 0; // 与地形外侧的水平延长线一致
+        if(x >= points[points.size()-1].x) return 0;
 
 		for (size_t i = 0; i < points.size() - 1; i++)
 		{
@@ -269,6 +262,15 @@ public:
 
 	int getStartX() const { return startX; }
 	int getEndX() const { return endX; }
+    const DynamicArray<Point>& getPoints() const { return points; }
+    // 用于同一刚体求解器的水平面/折线回归验证，也便于以后替换地形。
+    explicit HillSlope(const DynamicArray<Point>& terrain) : points(terrain)
+    {
+        if (points.size() < 2) throw std::runtime_error("Terrain needs two points");
+        for (size_t i = 1; i < points.size(); ++i)
+            if (points[i].x <= points[i - 1].x) throw std::runtime_error("Terrain x must increase");
+        startX = (int)points[0].x; endX = (int)points[points.size() - 1].x;
+    }
 
 	int getPeakX() const
 	{
@@ -305,376 +307,388 @@ public:
 	}
 };
 
-// ------------------------------------------------------------------ 滚石
+// ------------------------------------------------------------------ 定面积圆内接凸多边形
+const double POLY_PI = 3.14159265358979323846;
+double cross2(Point a, Point b) { return a.x * b.z - a.z * b.x; }
+double dot2(Point a, Point b) { return a.x * b.x + a.z * b.z; }
+Point plus2(Point a, Point b) { return Point(a.x + b.x, a.z + b.z); }
+Point minus2(Point a, Point b) { return Point(a.x - b.x, a.z - b.z); }
+Point times2(Point a, double t) { return Point(a.x * t, a.z * t); }
+Point rotate2(Point p, double a) { return Point(cos(a)*p.x-sin(a)*p.z, sin(a)*p.x+cos(a)*p.z); }
+struct ShapeSettings { int kMin, kMax; double r, area; };
+double maxPolygonArea(int k, double r) { return k * r * r * sin(2 * POLY_PI / k) / 2; }
+void validateShape(const ShapeSettings& c)
+{
+    if (c.kMin < 3 || c.kMax < c.kMin || c.kMax > 30)
+        throw std::runtime_error("Side range must satisfy 3 <= min <= max <= 30.");
+    if (!std::isfinite(c.r) || c.r < 0.05 || c.r > 10)
+        throw std::runtime_error("Radius must be between 0.05 and 10 metres.");
+    if (!std::isfinite(c.area) || c.area <= 0 || c.area > maxPolygonArea(c.kMin, c.r) + 1e-12*c.r*c.r)
+        throw std::runtime_error("Area must be positive and <= kMin*r*r*sin(2*pi/kMin)/2.");
+    // 极薄的形状会使接触求解病态，不把近似退化多边形伪装成可用刚体。
+    if (c.area < 1e-4 * c.r * c.r)
+        throw std::runtime_error("Area is too small for stable rigid-body simulation (S/r^2 >= 0.0001).");
+}
+struct PolygonShape
+{
+    std::vector<Point> local; // 以面积质心为原点，逆时针排列
+    Point circleCenter;       // 原生成圆的圆心在质心坐标系下的位置
+    double radius, area, mass, inertia, extent;
+    PolygonShape(const std::vector<Point>& onCircle, double r) : radius(r)
+    {
+        // 先平移至顶点均值附近，提高小面积多边形的数值精度。
+        Point origin;
+        for (size_t i=0; i<onCircle.size(); ++i) origin=plus2(origin,onCircle[i]);
+        origin=times2(origin,1.0/onCircle.size());
+        double twice=0; Point numerator;
+        for(size_t i=0;i<onCircle.size();++i) {
+            Point a=minus2(onCircle[i],origin), b=minus2(onCircle[(i+1)%onCircle.size()],origin);
+            double cr=cross2(a,b); twice+=cr; numerator=plus2(numerator,times2(plus2(a,b),cr));
+        }
+        if(twice<=0 || !std::isfinite(twice)) throw std::runtime_error("Degenerate polygon");
+        area=twice/2;
+        Point centroid=plus2(origin,times2(numerator,1/(3*twice)));
+        circleCenter=times2(centroid,-1); extent=0;
+        for(size_t i=0;i<onCircle.size();++i) {
+            local.push_back(minus2(onCircle[i],centroid));
+            extent=max(extent,sqrt(dot2(local.back(),local.back())));
+        }
+        double polar=0;
+        for(size_t i=0;i<local.size();++i) {
+            Point a=local[i], b=local[(i+1)%local.size()];
+            polar+=cross2(a,b)*(dot2(a,a)+dot2(a,b)+dot2(b,b))/12;
+        }
+        mass=ROCK_DENSITY*area; // 均匀棱柱，厚度固定 1m
+        inertia=ROCK_DENSITY*polar;
+        if(inertia<=0 || !std::isfinite(inertia)) throw std::runtime_error("Invalid inertia");
+    }
+};
+double randomUnit(std::mt19937& rng) { return (rng()+0.5)/4294967296.0; }
+PolygonShape generatePolygon(int k, double r, double target, std::mt19937& rng)
+{
+    validateShape(ShapeSettings{k,k,r,target});
+    const double maximum=maxPolygonArea(k,r);
+    if(fabs(target-maximum)<=1e-12*r*r) {
+        // 最大面积只能是正 k 边形；独立随机点恰好命中的概率为零。
+        double rotation=randomUnit(rng)*2*POLY_PI; std::vector<Point> p;
+        for(int i=0;i<k;++i) { double a=rotation+2*POLY_PI*i/k; p.push_back(Point(r*cos(a),r*sin(a))); }
+        return PolygonShape(p,r);
+    }
+    for(int attempt=0;attempt<50000;++attempt) {
+        std::vector<double> a(k-1);
+        for(int i=0;i<k-1;++i) a[i]=randomUnit(rng)*2*POLY_PI;
+        std::sort(a.begin(),a.end());
+        bool distinct=true; double base=0;
+        for(int i=0;i<k-1;++i) {
+            double gap=(i+1==k-1?a[0]+2*POLY_PI:a[i+1])-a[i];
+            if(gap<1e-7) distinct=false;
+            base+=r*r*sin(gap)/2;
+        }
+        if(!distinct || target<=base) continue;
+        std::vector<double> solutions;
+        for(int i=0;i<k-1;++i) {
+            double lo=a[i], hi=(i+1==k-1?a[0]+2*POLY_PI:a[i+1]);
+            double half=(hi-lo)/2;
+            // S = base + r^2*sin(half)*(cos(theta-mid)-cos(half)).
+            double c=(target-base)/(r*r*sin(half))+cos(half);
+            if(c>1 || c< -1) continue;
+            double d=acos(c), mid=(lo+hi)/2;
+            if(half-d<1e-7) continue;
+            solutions.push_back(fmod(mid-d,2*POLY_PI));
+            if(d>1e-10) solutions.push_back(fmod(mid+d,2*POLY_PI));
+        }
+        if(solutions.empty()) continue;
+        std::uniform_int_distribution<int> choose(0,(int)solutions.size()-1);
+        a.push_back(solutions[choose(rng)]); std::sort(a.begin(),a.end());
+        std::vector<Point> p;
+        for(size_t i=0;i<a.size();++i) p.push_back(Point(r*cos(a[i]),r*sin(a[i])));
+        PolygonShape shape(p,r);
+        if(fabs(shape.area-target)<=1e-9*r*r) return shape;
+    }
+    // 不偷偷缩放半径、修改面积、换边数或退化成别的采样分布。
+    throw std::runtime_error("No sample found in 50000 attempts. Retry or choose a less extreme area/side range.");
+}
+PolygonShape generatePolygon(const ShapeSettings& c, std::mt19937& rng)
+{
+    validateShape(c);
+    std::uniform_int_distribution<int> sides(c.kMin,c.kMax);
+    return generatePolygon(sides(rng),c.r,c.area,rng);
+}
+
+// ------------------------------------------------------------------ 多边形刚体与静态折线的接触
 class RollingStone
 {
-private:
-	double x, z;	// 球心位置（m）
-	double vx, vz;	// 速度（m/s）
-	double radius;	// 半径（m）
-	bool isRolling; // 是否还在运动
-	double energy;	// 动能（J）
-	double omega;	// 角速度（rad/s），纯滚动时 ω = v/r
-	double mass;	// 质量（kg），由半径和密度算出
-	DynamicArray<Point> trail;
-	int trailMax;
-
-	void updateMass()
-	{
-		double vol = 4.0 / 3.0 * 3.14159265358979 * radius * radius * radius;
-		mass = ROCK_DENSITY * vol;
-	}
-
+    PolygonShape shape;
+    double x,z,vx,vz,angle,omega,quietTime;
+    bool moving;
+    DynamicArray<Point> trail;
+    struct Contact { Point arm, normal; double depth, normalSum, tangentSum, bounce; };
+    std::vector<Point> vertices() const {
+        std::vector<Point> v;
+        for(size_t i=0;i<shape.local.size();++i) v.push_back(plus2(Point(x,z),rotate2(shape.local[i],angle)));
+        return v;
+    }
+    std::vector<Contact> contacts(const HillSlope& hill, double margin) const {
+        std::vector<Contact> out; std::vector<Point> v=vertices();
+        for(size_t i=0;i<v.size();++i) {
+            double th=hill.getSlopeAngle(v[i].x); Point n(sin(th),cos(th));
+            double d=(v[i].z-hill.getHeight(v[i].x))*n.z;
+            if(d<=margin) out.push_back(Contact{minus2(v[i],Point(x,z)),n,-d,0,0,0});
+        }
+        // 地形凸角可能从两个顶点之间穿入：同时检查多边形下边缘与地形控制点。
+        const DynamicArray<Point>& ground=hill.getPoints();
+        for(size_t i=0;i<v.size();++i) {
+            Point a=v[i], b=v[(i+1)%v.size()], edge=minus2(b,a);
+            if(edge.x<=1e-10) continue; // CCW 多边形朝上的内法线，仅取下边缘
+            double len=sqrt(dot2(edge,edge)); Point n(-edge.z/len,edge.x/len);
+            for(size_t j=0;j<ground.size();++j) {
+                if(ground[j].x<=a.x+1e-8 || ground[j].x>=b.x-1e-8) continue;
+                double t=(ground[j].x-a.x)/edge.x;
+                Point p=plus2(a,times2(edge,t));
+                double d=dot2(minus2(p,ground[j]),n);
+                if(d<=margin) out.push_back(Contact{minus2(p,Point(x,z)),n,-d,0,0,0});
+            }
+        }
+        return out;
+    }
+    double contactVelocity(const Contact& c, Point direction) const {
+        return dot2(Point(vx-omega*c.arm.z,vz+omega*c.arm.x),direction);
+    }
+    double effectiveMass(const Contact& c, Point direction) const {
+        double lever=cross2(c.arm,direction);
+        return 1/shape.mass+lever*lever/shape.inertia;
+    }
+    void impulse(const Contact& c, Point direction, double amount) {
+        vx+=direction.x*amount/shape.mass; vz+=direction.z*amount/shape.mass;
+        omega+=cross2(c.arm,direction)*amount/shape.inertia;
+    }
+    void substep(const HillSlope& hill, double h) {
+        vz-=GRAVITY*h;
+        double speed=sqrt(vx*vx+vz*vz);
+        // 平动空气阻力：迎风宽度近似 2r，棱柱厚度 1m，隐式衰减防止反向。
+        double damping=1+0.5*AIR_DENSITY*g_dragCoef*(2*shape.radius)*speed*h/shape.mass;
+        vx/=damping; vz/=damping;
+        x+=vx*h; z+=vz*h; angle=std::remainder(angle+omega*h,2*POLY_PI);
+        std::vector<Contact> c=contacts(hill,0.0002);
+        for(size_t i=0;i<c.size();++i) {
+            double vn=contactVelocity(c[i],c[i].normal);
+            c[i].bounce=vn< -0.5 ? -g_restitution*vn : 0;
+        }
+        for(int iteration=0;iteration<20;++iteration) {
+            for(size_t i=0;i<c.size();++i) {
+                Contact& q=c[i];
+                double old=q.normalSum;
+                q.normalSum=max(0.0,old+(q.bounce-contactVelocity(q,q.normal))/effectiveMass(q,q.normal));
+                impulse(q,q.normal,q.normalSum-old);
+                Point tangent(q.normal.z,-q.normal.x);
+                double limit=g_slideFriction*q.normalSum;
+                old=q.tangentSum;
+                q.tangentSum=max(-limit,min(limit,old-contactVelocity(q,tangent)/effectiveMass(q,tangent)));
+                impulse(q,tangent,q.tangentSum-old);
+            }
+        }
+        double support=0;
+        for(size_t i=0;i<c.size();++i) support+=c[i].normalSum;
+        double resistance=g_rollResist*shape.radius*support/shape.inertia;
+        omega-=max(-resistance,min(resistance,omega));
+        // 分离位置修正不改变速度，避免把穿透修正变成额外弹跳能量。
+        for(int iteration=0;iteration<12;++iteration) {
+            std::vector<Contact> correction=contacts(hill,0);
+            double worst=0;
+            for(size_t i=0;i<correction.size();++i) {
+                Contact& q=correction[i]; worst=max(worst,q.depth);
+                if(q.depth<=0.00005) continue;
+                double amount=min(0.02,0.7*(q.depth-0.00005))/effectiveMass(q,q.normal);
+                x+=q.normal.x*amount/shape.mass; z+=q.normal.z*amount/shape.mass;
+                angle+=cross2(q.arm,q.normal)*amount/shape.inertia;
+            }
+            if(worst<=0.0001) break;
+        }
+        if(!std::isfinite(x+z+vx+vz+angle+omega)) throw std::runtime_error("Non-finite rigid-body state");
+        // 不能仅凭质心低速判断停止：还需接触支撑及转动足够慢，持续 2 秒。
+        if(!c.empty() && getSpeed()<0.015 && fabs(omega)*shape.extent<0.015) quietTime+=h;
+        else quietTime=0;
+        if(quietTime>=2) { moving=false; vx=vz=omega=0; }
+    }
 public:
-	// 半径没有默认值：必须由调用者（main）给定，对象只负责保存和使用
-	RollingStone(double startX, double startZ, double r, double initVx)
-		: x(startX), z(startZ), vx(initVx), vz(0), radius(r), isRolling(true),
-		  energy(0), omega(0), mass(0), trailMax(40)
-	{
-		if (radius < MIN_RADIUS)
-			radius = MIN_RADIUS;
-		if (radius > MAX_RADIUS)
-			radius = MAX_RADIUS;
-		updateMass();
-		// 让球心正好贴在坡面上：沿法向抬高一个半径（真正的坡角在 adjustToGround 里再修正）
-		z = startZ + radius;
-	}
-
-	// 大气阻力系数：a_drag = kd·v²，kd = ½ρCdA/m
-	double dragK() const
-	{
-		double A = 3.14159265358979 * radius * radius;
-		return 0.5 * AIR_DENSITY * g_dragCoef * A / mass;
-	}
-
-	// 物理更新：一步 dt
-	void update(const HillSlope &hill, double dt)
-	{
-		if (!isRolling)
-			return;
-
-		double zg = hill.getHeight(x);
-		double th = hill.getSlopeAngle(x); // 坡角，>0 顺坡向下
-		double ct = cos(th), st = sin(th);
-		double nx = st, nz = ct;  // 坡面外法向
-		double dx = ct, dz = -st; // 顺坡切向（下坡方向）
-
-		// 球心到坡面的法向距离：竖直高差投影到法向
-		double dist = (z - zg) * ct;
-		double vt = vx * dx + vz * dz; // 切向速度（下坡为正）
-		double vn = vx * nx + vz * nz; // 法向速度（离开坡面为正）
-
-		if (dist <= radius + 1e-3)
-		{
-			// ---------------- 接触坡面 ----------------
-			z = zg + radius / ct; // 沿法向推回，恰好在表面
-
-			if (vn < -BOUNCE_MIN)
-			{
-				// 弹跳：法向按恢复系数反弹，切向按库仑冲量损失
-				double vnOut = -g_restitution * vn;
-				double dvt = g_slideFriction * (1.0 + g_restitution) * fabs(vn);
-				double sgn = (vt >= 0) ? 1.0 : -1.0;
-				double vtOut = fabs(vt) - dvt;
-				if (vtOut < 0)
-					vtOut = 0;
-				vt = sgn * vtOut;
-				vn = vnOut;
-				omega = vt / radius;
-			}
-			else
-			{
-				// 贴地运动：纯滚动 or 打滑
-				vn = 0;
-				double a;
-				if (tan(th) > g_slideFriction)
-				{
-					// 摩擦不足以维持纯滚动 → 打滑，转动不再同步
-					a = GRAVITY * (st - g_slideFriction * ct);
-					omega = 0;
-				}
-				else
-				{
-					// 实心球纯滚动：转动惯量 I = 2/5 mR²，只有 5/7 的重力分量用于平动
-					a = (5.0 / 7.0) * GRAVITY * st - g_rollResist * GRAVITY * ct;
-					omega = vt / radius;
-				}
-				vt += a * dt;
-				// 空气阻力（沿切向，与速度反向）
-				double kd = dragK();
-				vt -= kd * fabs(vt) * vt * dt;
-
-				// 速度很小且坡度小于摩擦角 → 被地面抓住，停住
-				if (fabs(vt) < REST_SPEED && tan(th) <= g_slideFriction)
-				{
-					vt = 0;
-					isRolling = false;
-				}
-				else if (vt < 0)
-				{
-					vt = 0;
-				}
-			}
-			vx = vt * dx + vn * nx;
-			vz = vt * dz + vn * nz;
-		}
-		else
-		{
-			// ---------------- 空中飞行 ----------------
-			vz -= GRAVITY * dt;
-			double sp = sqrt(vx * vx + vz * vz);
-			double kd = dragK();
-			if (sp > 1e-9)
-			{
-				vx -= kd * sp * vx * dt;
-				vz -= kd * sp * vz * dt;
-			}
-		}
-
-		// 位置更新
-		x += vx * dt;
-		z += vz * dt;
-
-		// 边界：坡顶以上、坡脚以外
-		if (x < hill.getStartX())
-		{
-			x = hill.getStartX();
-			vx = 0;
-		}
-		if (x >= hill.getEndX())
-		{
-			x = hill.getEndX();
-			vx = 0;
-			isRolling = false;
-		}
-
-		// 防止穿过坡面：位置夹回表面，并去掉指向坡内的法向速度
-		zg = hill.getHeight(x);
-		th = hill.getSlopeAngle(x);
-		{
-			double ct2 = cos(th), st2 = sin(th);
-			if ((z - zg) * ct2 < radius)
-			{
-				z = zg + radius / ct2;
-				double vn2 = vx * st2 + vz * ct2;
-				if (vn2 < 0)
-				{
-					vx -= vn2 * st2;
-					vz -= vn2 * ct2;
-				}
-			}
-		}
-
-		// 动能：滚动时含转动动能 E = ½mv² + ½Iω² = 0.7mv²；其他情况只有平动
-		double v2 = vx * vx + vz * vz;
-		if (fabs(omega) > 1e-9)
-			energy = 0.5 * mass * v2 + 0.2 * mass * radius * radius * omega * omega;
-		else
-			energy = 0.5 * mass * v2;
-
-		// 记录轨迹（世界坐标，米）
-		trail.push_back(Point(x, z));
-		if ((int)trail.size() > trailMax)
-			trail.erase_front();
-	}
-
-	// 绘制石头与轨迹（米 → 像素在这里完成）
-	void draw() const
-	{
-		// 轨迹
-		for (size_t i = 0; i < trail.size(); i++)
-		{
-			int alpha = 100 - (int)(i * 100 / trail.size());
-			(void)alpha;
-			setcolor(RGB(255, 100, 100));
-			setfillstyle(BS_SOLID);
-			int size = 3 - (int)(i * 2 / trail.size());
-			if (size < 1)
-				size = 1;
-			solidcircle((int)toPxX(trail[i].x), (int)toPxY(trail[i].z), size);
-		}
-
-		// 抗锯齿圆掩码（按屏幕半径缓存）
-		struct CircleMask
-		{
-			int r;
-			int sz;
-			unsigned char *alpha;
-			CircleMask() : r(0), sz(0), alpha(nullptr) {}
-			~CircleMask() { delete[] alpha; }
-			void generate(int radiusPx, int ss = 4)
-			{
-				if (radiusPx <= 0)
-					return;
-				if (r == radiusPx && alpha)
-					return;
-				delete[] alpha;
-				alpha = nullptr;
-				r = radiusPx;
-				sz = 2 * r + 1;
-				alpha = new unsigned char[sz * sz];
-				int samples = ss * ss;
-				double rr = (double)r;
-				for (int iy = -r; iy <= r; ++iy)
-				{
-					for (int ix = -r; ix <= r; ++ix)
-					{
-						int inside = 0;
-						for (int sy = 0; sy < ss; ++sy)
-						{
-							for (int sx = 0; sx < ss; ++sx)
-							{
-								double fx = ix + (sx + 0.5) / ss;
-								double fy = iy + (sy + 0.5) / ss;
-								if (fx * fx + fy * fy <= rr * rr)
-									inside++;
-							}
-						}
-						unsigned char a = (unsigned char)((inside * 255) / samples);
-						alpha[(iy + r) * sz + (ix + r)] = a;
-					}
-				}
-			}
-		};
-
-		int ir = (int)(radius * PX_PER_M);
-		if (ir < 4)
-			ir = 4; // 显示时给一个最小半径，否则 1 m 的石头只有 8 px
-
-		static CircleMask mask;
-		mask.generate(ir, 3);
-
-		COLORREF stoneColor = RGB(120, 120, 120);
-		int mr = mask.r;
-		int msz = mask.sz;
-
-		// 阴影
-		for (int yi = 0; yi < msz; ++yi)
-		{
-			for (int xi = 0; xi < msz; ++xi)
-			{
-				unsigned char a = mask.alpha[yi * msz + xi];
-				if (a == 0)
-					continue;
-				int px = (int)toPxX(x) - mr + xi + 2;
-				int py = (int)toPxY(z) - mr + yi + 3;
-				if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT)
-					continue;
-				COLORREF bg = getpixel(px, py);
-				COLORREF sc = RGB(60, 60, 60);
-				int alpha = a;
-				int inv = 255 - alpha;
-				int br = (GetRValue(sc) * alpha + GetRValue(bg) * inv) / 255;
-				int bgc = (GetGValue(sc) * alpha + GetGValue(bg) * inv) / 255;
-				int bb = (GetBValue(sc) * alpha + GetBValue(bg) * inv) / 255;
-				putpixel(px, py, RGB(br, bgc, bb));
-			}
-		}
-
-		// 主体
-		for (int yi = 0; yi < msz; ++yi)
-		{
-			for (int xi = 0; xi < msz; ++xi)
-			{
-				unsigned char a = mask.alpha[yi * msz + xi];
-				if (a == 0)
-					continue;
-				int px = (int)toPxX(x) - mr + xi;
-				int py = (int)toPxY(z) - mr + yi;
-				if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT)
-					continue;
-				COLORREF bg = getpixel(px, py);
-				int alpha = a;
-				int inv = 255 - alpha;
-				int rr = (GetRValue(stoneColor) * alpha + GetRValue(bg) * inv) / 255;
-				int gg = (GetGValue(stoneColor) * alpha + GetGValue(bg) * inv) / 255;
-				int bb = (GetBValue(stoneColor) * alpha + GetBValue(bg) * inv) / 255;
-				putpixel(px, py, RGB(rr, gg, bb));
-			}
-		}
-
-		// 高光
-		int hr = max(1, (int)(ir / 3));
-		static CircleMask hmask;
-		hmask.generate(hr, 3);
-		COLORREF highlight = RGB(180, 180, 180);
-		int hmr = hmask.r;
-		int hmsz = hmask.sz;
-		int hx = (int)(toPxX(x) - ir / 3);
-		int hy = (int)(toPxY(z) - ir / 3);
-		for (int yi = 0; yi < hmsz; ++yi)
-		{
-			for (int xi = 0; xi < hmsz; ++xi)
-			{
-				unsigned char a = hmask.alpha[yi * hmsz + xi];
-				if (a == 0)
-					continue;
-				int px = hx - hmr + xi;
-				int py = hy - hmr + yi;
-				if (px < 0 || px >= WIDTH || py < 0 || py >= HEIGHT)
-					continue;
-				COLORREF bg = getpixel(px, py);
-				int alpha = a;
-				int inv = 255 - alpha;
-				int rr = (GetRValue(highlight) * alpha + GetRValue(bg) * inv) / 255;
-				int gg = (GetGValue(highlight) * alpha + GetGValue(bg) * inv) / 255;
-				int bb = (GetBValue(highlight) * alpha + GetBValue(bg) * inv) / 255;
-				putpixel(px, py, RGB(rr, gg, bb));
-			}
-		}
-	}
-
-	bool isMoving() const { return isRolling; }
-	double getX() const { return x; }
-	double getZ() const { return z; }
-	double getSpeed() const { return sqrt(vx * vx + vz * vz); }
-	double getEnergy() const { return energy; }
-	double getRadius() const { return radius; }
-	double getMass() const { return mass; }
-	void setRadius(double r)
-	{
-		if (r < MIN_RADIUS)
-			r = MIN_RADIUS;
-		if (r > MAX_RADIUS)
-			r = MAX_RADIUS;
-		radius = r;
-		updateMass();
-	}
-	void adjustToGround(const HillSlope &hill)
-	{
-		double zg = hill.getHeight(x);
-		z = zg + radius / cos(hill.getSlopeAngle(x));
-		vz = 0;
-	}
-	// 顺坡释放：初速度沿坡面切向，而不是水平（更接近“石块从坡面脱离”）
-	void startAlongSlope(const HillSlope &hill, double v0)
-	{
-		double th = hill.getSlopeAngle(x);
-		vx = v0 * cos(th);
-		vz = -v0 * sin(th);
-		omega = v0 / radius;
-	}
+    RollingStone(double startX, double startZ, const PolygonShape& p)
+        : shape(p),x(startX),z(startZ),vx(0),vz(0),angle(0),omega(0),quietTime(0),moving(true) {}
+    void update(const HillSlope& hill, double dt) {
+        if(!moving) return;
+        // 运动越快/刚体越薄，子步越细；不改变外部统计/显示时间步长。
+        double scale=max(0.0005,min(shape.radius*0.1,shape.area/(4*shape.radius)));
+        int n=max(2,(int)ceil((getSpeed()+fabs(omega)*shape.extent)*dt/scale));
+        if(n>256) throw std::runtime_error("Motion requires too many collision substeps; choose a less thin shape.");
+        for(int i=0;i<n && moving;++i) substep(hill,dt/n);
+        trail.push_back(Point(x,z)); if(trail.size()>80) trail.erase_front();
+    }
+    void draw() const {
+        setcolor(RGB(210,80,30));
+        for(size_t i=1;i<trail.size();++i) line((int)toPxX(trail[i-1].x),(int)toPxY(trail[i-1].z),(int)toPxX(trail[i].x),(int)toPxY(trail[i].z));
+        std::vector<Point> v=vertices(); std::vector<int> xy;
+        for(size_t i=0;i<v.size();++i) { xy.push_back((int)toPxX(v[i].x)); xy.push_back((int)toPxY(v[i].z)); }
+        setfillcolor(RGB(105,110,125)); setcolor(RGB(30,35,50)); setlinestyle(PS_SOLID,2);
+        fillpoly((int)v.size(),xy.data());
+        setlinestyle(PS_SOLID,1); setfillcolor(RGB(255,220,40));
+        solidcircle((int)toPxX(x),(int)toPxY(z),2); // 黄色标记：质心，而非生成圆圆心
+    }
+    void adjustToGround(const HillSlope& hill) {
+        std::vector<Point> v=vertices(); double lift=-1e100;
+        for(size_t i=0;i<v.size();++i) lift=max(lift,hill.getHeight(v[i].x)-v[i].z);
+        const DynamicArray<Point>& ground=hill.getPoints();
+        for(size_t i=0;i<v.size();++i) {
+            Point a=v[i],b=v[(i+1)%v.size()]; if(b.x<=a.x) continue;
+            for(size_t j=0;j<ground.size();++j) if(ground[j].x>a.x && ground[j].x<b.x)
+                lift=max(lift,ground[j].z-(a.z+(b.z-a.z)*(ground[j].x-a.x)/(b.x-a.x)));
+        }
+        z+=lift+0.0001; vz=0;
+    }
+    void startAlongSlope(const HillSlope& hill,double speed) {
+        double th=hill.getSlopeAngle(x); vx=speed*cos(th); vz=-speed*sin(th);
+        omega=0; // 初始无自旋；转动由实际接触点冲量产生，不套用球体 omega=v/r。
+        moving=true; quietTime=0;
+    }
+    bool isMoving() const { return moving; }
+    double getX() const { return x; } double getZ() const { return z; }
+    double getSpeed() const { return sqrt(vx*vx+vz*vz); }
+    double getEnergy() const { return 0.5*shape.mass*(vx*vx+vz*vz)+0.5*shape.inertia*omega*omega; }
+    double getRadius() const { return shape.radius; }
+    double getMass() const { return shape.mass; }
+    double getArea() const { return shape.area; }
+    double getOmega() const { return omega; }
+    double getVerticalSpeed() const { return vz; }
+    int getSides() const { return (int)shape.local.size(); }
+    double penetration(const HillSlope& hill) const {
+        std::vector<Contact> c=contacts(hill,0); double depth=0;
+        for(size_t i=0;i<c.size();++i) depth=max(depth,c[i].depth);
+        return depth;
+    }
 };
 
-// ------------------------------------------------------------------ 主程序
-int main()
+// ------------------------------------------------------------------ 输入与回归验证（不新增源文件）
+bool readShapeSettings(ShapeSettings& settings)
 {
+    for(;;) {
+        TCHAR buf[160], defaults[160];
+        formatText(defaults,160,_T("%d %d %.8g %.8g"),settings.kMin,settings.kMax,settings.r,settings.area);
+        if(!InputBox(buf,160,_T("依次输入：最小边数 最大边数 圆半径r(m) 面积S(m^2)\n例如：3 6 2 3\n边数3~30；r为0.05~10m。S不得超过最小边数对应正多边形面积。\n每次R重新随机边数及顶点；G修改参数。厚度固定1m，初始无自旋。"),
+            _T("随机凸多边形"),defaults,650,270,false)) return false;
+        double values[4]; TCHAR* cursor=buf; bool valid=true;
+        for(int i=0;i<4;++i) { TCHAR* end=cursor; errno=0; values[i]=_tcstod(cursor,&end); if(end==cursor || errno==ERANGE || !std::isfinite(values[i])) valid=false; cursor=end; }
+        while(*cursor==_T(' ') || *cursor==_T('\t')) ++cursor;
+        if(*cursor || !valid || values[0]!=floor(values[0]) || values[1]!=floor(values[1]) || values[0]<3 || values[0]>30 || values[1]<3 || values[1]>30) {
+            MessageBox(GetHWnd(),_T("请输入四个有效数字，边数必须是3~30的整数。"),_T("输入错误"),MB_OK); continue;
+        }
+        ShapeSettings candidate={(int)values[0],(int)values[1],values[2],values[3]};
+        try { validateShape(candidate); settings=candidate; return true; }
+        catch(const std::exception& e) {
+            TCHAR message[300]; formatText(message,300,_T("此参数组合不可用。\n给定最小边数允许的最大面积为 %.10g m^2。\nS需大于0，且S/r^2至少为0.0001；r为0.05~10m。"),maxPolygonArea(candidate.kMin,candidate.r));
+            MessageBox(GetHWnd(),message,_T("参数超出范围"),MB_OK); (void)e;
+        }
+    }
+}
+void requireTest(bool ok,const char* text) { if(!ok) throw std::runtime_error(text); }
+int polygonSelfTest()
+{
+    try {
+        std::mt19937 rng(20261111);
+        double worstArea=0;
+        for(int k=3;k<=12;++k) for(int trial=0;trial<30;++trial) {
+            double r=0.2+randomUnit(rng)*2.8;
+            double target=maxPolygonArea(k,r)*(0.35+0.5*randomUnit(rng));
+            PolygonShape p=generatePolygon(k,r,target,rng);
+            worstArea=max(worstArea,fabs(p.area-target)/(r*r));
+            requireTest(p.local.size()==(size_t)k,"side count");
+            requireTest(fabs(p.area-target)<1e-9*r*r,"area");
+            for(int i=0;i<k;++i) {
+                Point q=minus2(p.local[i],p.circleCenter);
+                requireTest(fabs(sqrt(dot2(q,q))-r)<1e-9*r,"circle radius");
+                Point a=p.local[i],b=p.local[(i+1)%k],c=p.local[(i+2)%k];
+                requireTest(cross2(minus2(b,a),minus2(c,b))>0,"strict convexity");
+            }
+        }
+        PolygonShape square=generatePolygon(4,1,2,rng);
+        requireTest(fabs(square.inertia/square.mass-1.0/3)<1e-10,"square inertia");
+        bool rejected=false;
+        try { validateShape(ShapeSettings{3,6,1,2}); } catch(...) { rejected=true; }
+        requireTest(rejected,"impossible area rejected");
+        DynamicArray<Point> flat; flat.push_back(Point(-100,0)); flat.push_back(Point(100,0)); HillSlope floorHill(flat);
+        RollingStone drop(0,5,square); double maxPen=0;
+        for(int i=0;i<10000;++i) { drop.update(floorHill,DT); maxPen=max(maxPen,drop.penetration(floorHill)); }
+        requireTest(maxPen<0.005,"floor penetration"); requireTest(!drop.isMoving(),"body settles on floor");
+        double oldDrag=g_dragCoef,oldMu=g_slideFriction,oldRest=g_restitution,oldRoll=g_rollResist;
+        g_dragCoef=0; g_slideFriction=0; g_restitution=0.6; g_rollResist=0;
+        std::vector<Point> corners; double h=sqrt(0.5);
+        corners.push_back(Point(-h,-h)); corners.push_back(Point(h,-h));
+        corners.push_back(Point(h,h)); corners.push_back(Point(-h,h));
+        PolygonShape alignedSquare(corners,1);
+        RollingStone bounce(0,5,alignedSquare); bool bounced=false;
+        for(int i=0;i<3000;++i) {
+            double before=bounce.getVerticalSpeed(); bounce.update(floorHill,DT);
+            if(before< -1 && bounce.getVerticalSpeed()>0) {
+                requireTest(fabs(bounce.getVerticalSpeed()/(-before)-0.6)<0.01,"restitution response");
+                requireTest(fabs(bounce.getOmega())<0.01,"symmetric contact torque"); bounced=true; break;
+            }
+        }
+        requireTest(bounced,"drop bounces");
+        RollingStone falling(0,100,alignedSquare);
+        for(int i=0;i<100;++i) falling.update(floorHill,DT);
+        requireTest(fabs(falling.getVerticalSpeed()+GRAVITY*DT*100)<1e-9,"free-fall acceleration");
+        requireTest(fabs(falling.getOmega())<1e-12,"no torque in free fall");
+        DynamicArray<Point> ridge; ridge.push_back(Point(-10,0)); ridge.push_back(Point(0,1)); ridge.push_back(Point(10,0));
+        HillSlope ridgeHill(ridge); RollingStone ridgeBody(0,0,alignedSquare); ridgeBody.adjustToGround(ridgeHill);
+        requireTest(ridgeBody.penetration(ridgeHill)<0.0001,"terrain vertex under polygon edge");
+        g_dragCoef=oldDrag; g_slideFriction=oldMu; g_restitution=oldRest; g_rollResist=oldRoll;
+        for(int k=3;k<=30;++k) {
+            PolygonShape regular=generatePolygon(k,2,maxPolygonArea(k,2),rng);
+            requireTest(fabs(regular.area-maxPolygonArea(k,2))<1e-9,"maximum-area regular polygon");
+        }
+        std::mt19937 same1(123),same2(123);
+        PolygonShape repeat1=generatePolygon(ShapeSettings{3,8,2,3},same1),repeat2=generatePolygon(ShapeSettings{3,8,2,3},same2);
+        requireTest(repeat1.local.size()==repeat2.local.size(),"deterministic side count");
+        for(size_t i=0;i<repeat1.local.size();++i) requireTest(dot2(minus2(repeat1.local[i],repeat2.local[i]),minus2(repeat1.local[i],repeat2.local[i]))<1e-20,"repeatable sample");
+        HillSlope hill;
+        for(int j=0;j<12;++j) {
+            PolygonShape p=generatePolygon(ShapeSettings{3,8,2,3},rng);
+            RollingStone body(2,hill.getHeight(2),p); body.adjustToGround(hill); body.startAlongSlope(hill,1.5);
+            for(int i=0;i<20000 && body.isMoving() && body.getX()<hill.getEndX();++i) {
+                body.update(hill,DT); maxPen=max(maxPen,body.penetration(hill));
+                requireTest(body.getEnergy()<p.mass*GRAVITY*100,"no explosive energy gain");
+            }
+        }
+        requireTest(maxPen<0.01,"slope penetration");
+        std::printf("PASS: 300 random geometries, area/radius/convexity, inertia, invalid input, restitution, free fall, ridge contact, regular limit, deterministic seed, drop/rest and 12 slope trajectories. Max area/r^2 error=%.3g; max penetration=%.6g m\n",worstArea,maxPen);
+        return 0;
+    } catch(const std::exception& e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }
+}
+
+// ------------------------------------------------------------------ 主程序
+int main(int argc, char** argv)
+{
+    if(argc>1 && std::strcmp(argv[1],"--self-test")==0) return polygonSelfTest();
 	initgraph(WIDTH, HEIGHT);
 	setbkcolor(RGB(135, 206, 235));
+    SetWindowText(GetHWnd(),_T("Rolling Stone - Convex Polygon"));
 	BeginBatchDraw();
 
 	HillSlope hill;
 	int initX = hill.getPeakX();
 	double initZ = hill.getHeight((double)initX);
 
-	// ---- 滚石参数：在 main 里给定，构造时交给滚石对象（对象内部只保存、不再有默认值）----
-	double stoneRadius = 2.0; // 滚石半径 (m)
-	double stoneSpeed = 1.5;  // 顺坡释放的初速度 (m/s)
-
-	RollingStone stone((double)initX, initZ, stoneRadius, 0.0);
-	stone.adjustToGround(hill);
-	stone.startAlongSlope(hill, stoneSpeed);
-	int valleyX = hill.getValleyX();
+    ShapeSettings shapeSettings={3,6,2.0,3.0};
+    std::mt19937 shapeRng((unsigned int)GetTickCount() ^ (unsigned int)GetCurrentProcessId());
+    if(!readShapeSettings(shapeSettings)) { EndBatchDraw(); closegraph(); return 0; }
+    double stoneSpeed=1.5;
+    PolygonShape initial=generatePolygon(3,2,3,shapeRng);
+    for(;;) {
+        try { initial=generatePolygon(shapeSettings,shapeRng); break; }
+        catch(const std::exception& e) {
+            MessageBoxA(GetHWnd(),e.what(),"Shape generation failed",MB_OK|MB_ICONWARNING);
+            if(!readShapeSettings(shapeSettings)) { EndBatchDraw(); closegraph(); return 0; }
+        }
+    }
+    RollingStone stone((double)initX,initZ,initial);
+    stone.adjustToGround(hill); stone.startAlongSlope(hill,stoneSpeed);
 	bool simEnded = false;
 
 	bool paused = false;
@@ -700,14 +714,17 @@ int main()
 
 	settextstyle(16, 0, _T("Consolas"));
 	setcolor(RGB(50, 50, 50));
-	outtextxy(10, 20, _T("Rolling Stone Simulator - SI Units (m, s, kg, J)"));
-	outtextxy(10, 45, _T("Controls: SPACE=Pause, M=Parameters, P=Pause menu, R=Reset, ESC=Exit"));
+	outtextxy(10, 20, _T("Convex polygon rigid body - SI units; thickness=1 m"));
+	outtextxy(10, 45, _T("SPACE=Pause M=Physics R=New polygon G=Geometry ESC=Exit"));
 
 	while (true)
 	{
-		if (_kbhit())
-		{
-			int key = _getch();
+        int key=-1;
+        ExMessage event;
+        if(peekmessage(&event,EX_CHAR)) key=(int)event.ch;
+        else if(_kbhit()) key=_getch();
+        if(key>=0)
+        {
 			if (key == 27)
 				break;
 			if (key == 32)
@@ -734,30 +751,21 @@ int main()
 					inPauseMenu = false;
 				}
 			}
-			if (key == 'r' || key == 'R')
-			{
-				double keepRadius = stone.getRadius(); // 保留用户用 +/- 改过的半径
-				stone = RollingStone((double)initX, initZ, keepRadius, 0.0);
-				stone.adjustToGround(hill);
-				stone.startAlongSlope(hill, stoneSpeed);
-				paused = false;
-				simEnded = false;
-				stoppedDuration = 0.0;
-				stoppedTriggered = false;
-				speedData.clear();
-				simTime = 0.0;
-				cleardevice();
-			}
-			if (key == '+' || key == '=')
-			{
-				stone.setRadius(stone.getRadius() + 0.1);
-				stone.adjustToGround(hill);
-			}
-			if (key == '-' || key == '_')
-			{
-				stone.setRadius(stone.getRadius() - 0.1);
-				stone.adjustToGround(hill);
-			}
+            if(key=='r' || key=='R' || key=='g' || key=='G')
+            {
+                ShapeSettings candidate=shapeSettings;
+                bool apply=(key=='r' || key=='R') || readShapeSettings(candidate);
+                if(apply) try {
+                    PolygonShape generated=generatePolygon(candidate,shapeRng);
+                    stone=RollingStone((double)initX,initZ,generated);
+                    stone.adjustToGround(hill); stone.startAlongSlope(hill,stoneSpeed);
+                    shapeSettings=candidate;
+                    paused=false; simEnded=false; inMenu=false; inPauseMenu=false;
+                    stoppedDuration=0; stoppedTriggered=false; speedData.clear(); simTime=0;
+                } catch(const std::exception& e) {
+                    MessageBoxA(GetHWnd(),e.what(),"Shape generation failed - previous shape retained",MB_OK|MB_ICONWARNING);
+                }
+            }
 			if (key == 'm' || key == 'M')
 			{
 				inMenu = !inMenu;
@@ -808,6 +816,12 @@ int main()
 						g_playbackFactor = playbackOptions[playbackIndex];
 					}
 				}
+                if(key=='a'||key=='A'||key=='d'||key=='D') {
+                    std::snprintf(inputBuf[0],32,"%.3f",g_rollResist);
+                    std::snprintf(inputBuf[1],32,"%.3f",g_slideFriction);
+                    std::snprintf(inputBuf[2],32,"%.3f",g_restitution);
+                    std::snprintf(inputBuf[3],32,"%.3f",g_dragCoef);
+                }
 				if (key == 13)
 				{
 					inMenu = false;
@@ -815,13 +829,18 @@ int main()
 			}
 		}
 
-		if (!paused)
 		{
+            if(!paused && !inMenu && !inPauseMenu && !simEnded)
+            {
 			// 每帧 8 个子步（2 ms × 8 = 16 ms），倍速就是“每帧多跑几步”
 			int steps = STEPS_PER_FRAME * g_playbackFactor;
 			for (int i = 0; i < steps; ++i)
 			{
-				stone.update(hill, DT);
+                try { stone.update(hill, DT); }
+                catch(const std::exception& e) {
+                    paused=true; simEnded=true;
+                    MessageBoxA(GetHWnd(),e.what(),"Simulation stopped",MB_OK|MB_ICONWARNING); break;
+                }
 				simTime += DT;
 			}
 			double curSpeed = stone.getSpeed();
@@ -835,31 +854,27 @@ int main()
 			{
 				if (stone.getX() >= hill.getEndX() - 0.5)
 				{
-					MessageBox(NULL, _T("滚石到达坡脚，模拟结束"), _T("提示"), MB_OK | MB_ICONINFORMATION);
-					EndBatchDraw();
-					closegraph();
-					return 0;
+                    simEnded=true; paused=true;
 				}
 			}
 
 			if (!stoppedTriggered && !simEnded)
 			{
-				if (curSpeed < REST_SPEED)
+				if (!stone.isMoving())
 					stoppedDuration += STEPS_PER_FRAME * DT * g_playbackFactor;
 				else
 					stoppedDuration = 0.0;
 				if (stoppedDuration >= 3.0)
 				{
-					MessageBox(NULL, _T("滚石停止运动，模拟结束"), _T("提示"), MB_OK | MB_ICONINFORMATION);
-					EndBatchDraw();
-					closegraph();
-					return 0;
+                    simEnded=true; paused=true;
 				}
 			}
 
+            }
 			cleardevice();
 			setbkcolor(RGB(135, 206, 235));
 
+			hill.draw();
 			if (inMenu)
 			{
 				setfillcolor(RGB(240, 240, 240));
@@ -877,11 +892,11 @@ int main()
 					else
 						setcolor(RGB(0, 0, 0));
 					if (i == 0)
-						formatText(bufMenu, 160, _T("滚动阻力 c_rr (0.02-0.20):"));
+						formatText(bufMenu, 160, _T("滚动阻矩系数 (0-0.30):"));
 					else if (i == 1)
-						formatText(bufMenu, 160, _T("摩擦系数 mu (0.3-0.8):"));
+						formatText(bufMenu, 160, _T("摩擦系数 mu (0-1):"));
 					else if (i == 2)
-						formatText(bufMenu, 160, _T("恢复系数 e (0.2-0.6):"));
+						formatText(bufMenu, 160, _T("恢复系数 e (0-0.90):"));
 					else
 						formatText(bufMenu, 160, _T("空气阻力 Cd (0=真空):"));
 					outtextxy(90, y, bufMenu);
@@ -908,63 +923,6 @@ int main()
 				setcolor(RGB(0, 0, 0));
 				outtextxy(275, 388, _T("启动模拟"));
 
-				if (GetAsyncKeyState(VK_RETURN) & 0x8000)
-				{
-					double v0 = atof(inputBuf[0]);
-					double v1 = atof(inputBuf[1]);
-					double v2 = atof(inputBuf[2]);
-					double v3 = atof(inputBuf[3]);
-					if (v0 < 0.0)
-						v0 = 0.0;
-					if (v0 > 0.30)
-						v0 = 0.30;
-					if (v1 < 0.0)
-						v1 = 0.0;
-					if (v1 > 1.00)
-						v1 = 1.00;
-					if (v2 < 0.0)
-						v2 = 0.0;
-					if (v2 > 0.90)
-						v2 = 0.90;
-					if (v3 < 0.0)
-						v3 = 0.0;
-					if (v3 > 2.00)
-						v3 = 2.00;
-					g_rollResist = v0;
-					g_slideFriction = v1;
-					g_restitution = v2;
-					g_dragCoef = v3;
-					inMenu = false;
-					paused = false;
-					simEnded = false;
-					stoppedDuration = 0.0;
-					stoppedTriggered = false;
-					cleardevice();
-				}
-				if (menuSel >= 0 && menuSel <= 3)
-				{
-					for (int c = 0; c < 256; c++)
-					{
-						if (GetAsyncKeyState(c) & 0x8000)
-						{
-							if (c == VK_BACK)
-							{
-								size_t len = strlen(inputBuf[menuSel]);
-								if (len > 0)
-									inputBuf[menuSel][len - 1] = 0;
-							}
-							else if ((c >= '0' && c <= '9') || c == '.' || c == '-')
-							{
-								size_t len = strlen(inputBuf[menuSel]);
-								if (len + 1 < sizeof(inputBuf[menuSel]))
-								{
-									inputBuf[menuSel][len] = (char)c;
-									inputBuf[menuSel][len + 1] = 0;
-								}
-							}
-						}
-					}
-				}
 
 				setcolor(RGB(80, 80, 80));
 				outtextxy(90, 360, _T("按 R 重置模拟，按 M 退出菜单"));
@@ -989,8 +947,12 @@ int main()
 				outtextxy(WIDTH / 2 - 40, HEIGHT / 2 + 18, _T("Continue"));
 			}
 
-			hill.draw();
-			stone.draw();
+            stone.draw();
+            TCHAR geometryInfo[200];
+            formatText(geometryInfo,200,_T("k=%d  r=%.4g m  S=%.8g m2  omega=%.3f rad/s"),stone.getSides(),stone.getRadius(),stone.getArea(),stone.getOmega());
+            settextstyle(16,0,_T("Consolas")); setcolor(RGB(20,30,50));
+            outtextxy(10,10,geometryInfo);
+            outtextxy(10,32,_T("SPACE:pause  R:new polygon  G:geometry  M:physics  ESC:exit"));
 
 			// -------- HUD（米制） --------
 			TCHAR info[200];
@@ -1009,7 +971,7 @@ int main()
 			formatText(info, 200, _T("Energy: %.1f kJ"), stone.getEnergy() / 1000.0);
 			outtextxy(10, HEIGHT - 40, info);
 
-			formatText(info, 200, _T("Diameter: %.2f m   Mass: %.0f kg"), stone.getRadius() * 2.0, stone.getMass());
+			formatText(info, 200, _T("Circle r: %.2f m   Mass: %.0f kg"), stone.getRadius(), stone.getMass());
 			outtextxy(10, HEIGHT - 20, info);
 
 			formatText(info, 200, _T("Status: %s"), stone.isMoving() ? _T("ROLLING") : _T("STOPPED"));
@@ -1148,17 +1110,12 @@ int main()
 			FlushBatchDraw();
 			Sleep(16);
 		}
-		else
-		{
-			FlushBatchDraw();
-			Sleep(50);
-		}
 
-		if (!stone.isMoving() && !paused)
+		if (!stone.isMoving() || simEnded)
 		{
 			setcolor(RGB(0, 255, 0));
 			settextstyle(16, 0, _T("Consolas"));
-			outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Stone Stopped! Press R to restart"));
+			outtextxy(WIDTH / 2 - 80, HEIGHT - 150, _T("Ended: R=new polygon, G=geometry"));
 		}
 	}
 
